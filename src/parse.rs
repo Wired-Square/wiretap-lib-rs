@@ -1,0 +1,990 @@
+//! Parse a TOML catalogue into the unified [`Catalog`] model.
+//!
+//! This is a Rust port of WireTAP's `src/utils/catalogParser.ts`
+//! (`parseCatalogText`): it resolves the CAN/Serial frame sections including
+//! mirror/copy inheritance and header-field masks, and reuses
+//! [`crate::modbus::ModbusManifest`] for the Modbus section so the two Modbus
+//! authoring shorthands (register-from-key, signal-less register) stay
+//! single-sourced.
+
+use std::collections::BTreeMap;
+
+use toml::Value;
+
+use crate::modbus::{ManifestError, ModbusManifest};
+use crate::model::*;
+
+#[derive(Debug, thiserror::Error)]
+pub enum CatalogError {
+    #[error("catalogue is not valid TOML: {0}")]
+    Toml(#[from] toml::de::Error),
+}
+
+// ---------- small typed accessors over toml::Value ----------
+
+fn get<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
+    v.as_table().and_then(|t| t.get(key))
+}
+
+fn as_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    get(v, key).and_then(Value::as_str)
+}
+
+fn as_i64(v: &Value, key: &str) -> Option<i64> {
+    get(v, key).and_then(Value::as_integer)
+}
+
+/// A number that may be written as an integer or float in TOML.
+fn as_f64(v: &Value, key: &str) -> Option<f64> {
+    get(v, key).and_then(|n| n.as_float().or_else(|| n.as_integer().map(|i| i as f64)))
+}
+
+fn as_bool(v: &Value, key: &str) -> Option<bool> {
+    get(v, key).and_then(Value::as_bool)
+}
+
+fn as_u32(v: &Value, key: &str) -> Option<u32> {
+    as_i64(v, key).and_then(|i| u32::try_from(i).ok())
+}
+
+fn parse_endianness(s: &str) -> Option<Endianness> {
+    match s {
+        "big" => Some(Endianness::Big),
+        "little" => Some(Endianness::Little),
+        _ => None,
+    }
+}
+
+fn endianness_at(v: &Value, key: &str) -> Option<Endianness> {
+    as_str(v, key).and_then(parse_endianness)
+}
+
+fn parse_format(s: &str) -> Option<SignalFormat> {
+    match s {
+        "enum" => Some(SignalFormat::Enum),
+        "ascii" => Some(SignalFormat::Ascii),
+        "utf8" => Some(SignalFormat::Utf8),
+        "hex" => Some(SignalFormat::Hex),
+        "unix_time" => Some(SignalFormat::UnixTime),
+        _ => None,
+    }
+}
+
+fn parse_confidence(s: &str) -> Option<Confidence> {
+    match s {
+        "none" => Some(Confidence::None),
+        "low" => Some(Confidence::Low),
+        "medium" => Some(Confidence::Medium),
+        "high" => Some(Confidence::High),
+        _ => None,
+    }
+}
+
+/// Parse a CAN/serial/modbus id key (hex `0x..` or decimal) to a number.
+/// Mirrors `parseCanId`.
+pub fn parse_id(id: &str) -> Option<u32> {
+    let t = id.trim();
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).ok()
+    } else if t.chars().all(|c| c.is_ascii_digit()) && !t.is_empty() {
+        t.parse::<u32>().ok()
+    } else {
+        None
+    }
+}
+
+/// Find a frame body in a section by its numeric id value (so `0x123` and `291`
+/// match). Mirrors `findFrameByNumericId`.
+fn find_frame_by_numeric_id<'a>(target: &str, section: &'a Value) -> Option<&'a Value> {
+    let target_num = parse_id(target)?;
+    let table = section.as_table()?;
+    table
+        .iter()
+        .find(|(k, _)| parse_id(k) == Some(target_num))
+        .map(|(_, v)| v)
+}
+
+/// `value` may be a number (`copy = 291`) or a string (`copy = "0x123"`).
+fn id_ref_to_string(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Integer(i) => Some(i.to_string()),
+        _ => None,
+    }
+}
+
+// ---------- signals / mux ----------
+
+/// Port of `normaliseSignal`: map `byte_order` → `endianness`, carry fields.
+fn normalise_signal(raw: &Value, inherited: bool) -> Signal {
+    let endianness = endianness_at(raw, "byte_order").or_else(|| endianness_at(raw, "endianness"));
+    Signal {
+        name: as_str(raw, "name").map(str::to_string),
+        start_bit: as_u32(raw, "start_bit"),
+        bit_length: as_u32(raw, "bit_length"),
+        signed: as_bool(raw, "signed"),
+        endianness,
+        word_order: endianness_at(raw, "word_order"),
+        factor: as_f64(raw, "factor"),
+        offset: as_f64(raw, "offset"),
+        unit: as_str(raw, "unit").map(str::to_string),
+        min: as_f64(raw, "min"),
+        max: as_f64(raw, "max"),
+        format: as_str(raw, "format").and_then(parse_format),
+        enum_map: parse_enum_map(get(raw, "enum")),
+        confidence: as_str(raw, "confidence").and_then(parse_confidence),
+        inherited: inherited || as_bool(raw, "_inherited").unwrap_or(false),
+    }
+}
+
+fn parse_enum_map(v: Option<&Value>) -> Option<BTreeMap<i64, String>> {
+    let table = v?.as_table()?;
+    let mut out = BTreeMap::new();
+    for (k, val) in table {
+        if let (Ok(key), Some(label)) = (k.parse::<i64>(), val.as_str()) {
+            out.insert(key, label.to_string());
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn normalise_signals(arr: Option<&Value>) -> Vec<Signal> {
+    arr.and_then(Value::as_array)
+        .map(|a| a.iter().map(|s| normalise_signal(s, false)).collect())
+        .unwrap_or_default()
+}
+
+/// Whether a mux table key denotes a case (numeric, range `0-3`, or list
+/// `1,2,5`) rather than a reserved key. Mirrors `isMuxCaseKey`.
+fn is_mux_case_key(key: &str) -> bool {
+    if matches!(key, "name" | "start_bit" | "bit_length" | "default") {
+        return false;
+    }
+    key.split(',').all(|part| {
+        let part = part.trim();
+        match part.split_once('-') {
+            Some((a, b)) => {
+                !a.is_empty()
+                    && a.chars().all(|c| c.is_ascii_digit())
+                    && !b.is_empty()
+                    && b.chars().all(|c| c.is_ascii_digit())
+            }
+            None => !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()),
+        }
+    })
+}
+
+/// Port of `parseMux`.
+fn parse_mux(mux: Option<&Value>) -> Option<Mux> {
+    let mux = mux?;
+    let table = mux.as_table()?;
+    let mut cases = BTreeMap::new();
+    for (key, case_data) in table {
+        if !is_mux_case_key(key) {
+            continue;
+        }
+        let signals = normalise_signals(get(case_data, "signals"));
+        let nested = parse_mux(get(case_data, "mux")).map(Box::new);
+        cases.insert(
+            key.clone(),
+            MuxCase {
+                signals,
+                mux: nested,
+            },
+        );
+    }
+    Some(Mux {
+        name: as_str(mux, "name").map(str::to_string),
+        start_bit: as_u32(mux, "start_bit").unwrap_or(0),
+        bit_length: as_u32(mux, "bit_length").unwrap_or(8),
+        cases,
+    })
+}
+
+/// Frame `tx.interval` / `tx.interval_ms` (either spelling).
+fn frame_interval(body: &Value) -> Option<u64> {
+    let tx = get(body, "tx")?;
+    as_i64(tx, "interval")
+        .or_else(|| as_i64(tx, "interval_ms"))
+        .and_then(|i| u64::try_from(i).ok())
+}
+
+// ---------- mirror / copy inheritance ----------
+
+#[derive(Default)]
+struct InheritedMeta {
+    length: Option<u32>,
+    transmitter: Option<String>,
+    interval: Option<u64>,
+}
+
+struct Resolution {
+    signals: Vec<Signal>,
+    mux: Option<Mux>,
+    mirror_of: Option<String>,
+    copy_from: Option<String>,
+    inherited: InheritedMeta,
+}
+
+fn bit_key(s: &Value) -> String {
+    format!(
+        "{}:{}",
+        as_i64(s, "start_bit").unwrap_or(0),
+        as_i64(s, "bit_length").unwrap_or(0)
+    )
+}
+
+fn raw_signals(body: &Value) -> Vec<Value> {
+    get(body, "signals")
+        .or_else(|| get(body, "signal"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Port of `resolveMirrorInheritance`.
+fn resolve_mirror_inheritance(body: &Value, all_frames: &Value) -> Resolution {
+    let copy_from = get(body, "copy").and_then(id_ref_to_string);
+    let mirror_of = get(body, "mirror_of").and_then(id_ref_to_string);
+
+    let signals_raw = raw_signals(body);
+    let mut mux = get(body, "mux").cloned();
+    let mut inherited = InheritedMeta::default();
+
+    // copy: metadata only.
+    if let Some(src) = copy_from
+        .as_deref()
+        .and_then(|c| find_frame_by_numeric_id(c, all_frames))
+    {
+        inherit_metadata(body, src, &mut inherited);
+    }
+
+    // mirror: signals + metadata.
+    let mut result_signals: Vec<Signal>;
+    if let Some(src) = mirror_of
+        .as_deref()
+        .and_then(|m| find_frame_by_numeric_id(m, all_frames))
+    {
+        let primary = raw_signals(src);
+        let mirror_by_pos: BTreeMap<String, &Value> =
+            signals_raw.iter().map(|s| (bit_key(s), s)).collect();
+
+        // Start with primary signals, overridden by position; inherited unless
+        // overridden.
+        result_signals = primary
+            .iter()
+            .map(|ps| match mirror_by_pos.get(&bit_key(ps)) {
+                Some(over) => normalise_signal(over, false),
+                None => normalise_signal(ps, true),
+            })
+            .collect();
+
+        // Add mirror signals at new positions (not inherited).
+        let primary_positions: std::collections::BTreeSet<String> =
+            primary.iter().map(bit_key).collect();
+        for ms in &signals_raw {
+            if !primary_positions.contains(&bit_key(ms)) {
+                result_signals.push(normalise_signal(ms, false));
+            }
+        }
+
+        // Inherit mux if not locally defined.
+        if mux.is_none() {
+            if let Some(src_mux) = get(src, "mux") {
+                mux = Some(src_mux.clone());
+            }
+        }
+
+        // Inherit metadata unless this frame is also a copy (copy already did it).
+        if copy_from.is_none() {
+            inherit_metadata(body, src, &mut inherited);
+        }
+    } else {
+        result_signals = signals_raw
+            .iter()
+            .map(|s| normalise_signal(s, false))
+            .collect();
+    }
+
+    Resolution {
+        signals: result_signals,
+        mux: parse_mux(mux.as_ref()),
+        mirror_of,
+        copy_from,
+        inherited,
+    }
+}
+
+fn inherit_metadata(body: &Value, src: &Value, out: &mut InheritedMeta) {
+    if as_i64(body, "length").is_none() {
+        if let Some(len) = as_u32(src, "length") {
+            out.length = Some(len);
+        }
+    }
+    if as_str(body, "transmitter").is_none() {
+        if let Some(tx) = as_str(src, "transmitter") {
+            out.transmitter = Some(tx.to_string());
+        }
+    }
+    if frame_interval(body).is_none() {
+        if let Some(iv) = frame_interval(src) {
+            out.interval = Some(iv);
+        }
+    }
+}
+
+// ---------- protocol configs ----------
+
+fn parse_header_fields(section: Option<&Value>, serial: bool) -> BTreeMap<String, HeaderField> {
+    let mut out = BTreeMap::new();
+    let Some(table) = section.and_then(Value::as_table) else {
+        return out;
+    };
+    for (name, def) in table {
+        // mask, or (serial only) legacy start_byte + bytes.
+        let mask = if let Some(m) = as_u32(def, "mask") {
+            m
+        } else if serial {
+            match as_u32(def, "start_byte") {
+                Some(start_byte) => {
+                    let bytes = as_u32(def, "bytes").unwrap_or(1);
+                    let num_bits = bytes * 8;
+                    let base = if num_bits >= 32 {
+                        u32::MAX
+                    } else {
+                        (1u32 << num_bits) - 1
+                    };
+                    base.wrapping_shl(start_byte * 8)
+                }
+                None => continue,
+            }
+        } else {
+            continue;
+        };
+
+        let endianness =
+            endianness_at(def, "endianness").or_else(|| endianness_at(def, "byte_order"));
+        let format = as_str(def, "format")
+            .filter(|f| *f == "hex" || *f == "decimal")
+            .map(str::to_string);
+        out.insert(
+            name.clone(),
+            HeaderField {
+                mask,
+                shift: as_u32(def, "shift"),
+                format,
+                endianness,
+            },
+        );
+    }
+    out
+}
+
+fn parse_can_config(root: &Value) -> Option<CanConfig> {
+    let section = get(root, "meta").and_then(|m| get(m, "can")).or_else(|| {
+        get(root, "frame")
+            .and_then(|f| get(f, "can"))
+            .and_then(|c| get(c, "config"))
+    })?;
+
+    let cfg = CanConfig {
+        default_byte_order: endianness_at(section, "default_byte_order")
+            .or_else(|| endianness_at(section, "default_endianness")),
+        default_interval: as_i64(section, "default_interval").and_then(|i| u64::try_from(i).ok()),
+        default_extended: as_bool(section, "default_extended"),
+        default_fd: as_bool(section, "default_fd"),
+        frame_id_mask: as_u32(section, "frame_id_mask"),
+        fields: parse_header_fields(get(section, "fields"), false),
+    };
+    if cfg == CanConfig::default() {
+        None
+    } else {
+        Some(cfg)
+    }
+}
+
+fn parse_serial_config(root: &Value) -> Option<SerialConfig> {
+    let section = get(root, "meta").and_then(|m| get(m, "serial"))?;
+
+    let encoding = as_str(section, "encoding")
+        .filter(|e| matches!(*e, "slip" | "cobs" | "raw" | "length_prefixed"))
+        .map(str::to_string);
+
+    let checksum = get(section, "checksum").and_then(parse_checksum);
+
+    let cfg = SerialConfig {
+        encoding,
+        byte_order: endianness_at(section, "byte_order"),
+        frame_id_mask: as_u32(section, "frame_id_mask"),
+        header_length: as_u32(section, "header_length"),
+        min_frame_length: as_u32(section, "min_frame_length"),
+        checksum,
+        fields: parse_header_fields(get(section, "fields"), true),
+    };
+    if cfg == SerialConfig::default() {
+        None
+    } else {
+        Some(cfg)
+    }
+}
+
+fn parse_checksum(section: &Value) -> Option<ChecksumConfig> {
+    let algorithm = as_str(section, "algorithm")?.to_string();
+    let start_byte = as_u32(section, "start_byte")?;
+    Some(ChecksumConfig {
+        algorithm,
+        start_byte,
+        byte_length: as_u32(section, "byte_length").unwrap_or(1),
+        calc_start_byte: as_u32(section, "calc_start_byte").unwrap_or(0),
+        calc_end_byte: as_u32(section, "calc_end_byte"),
+        big_endian: as_bool(section, "big_endian").unwrap_or(false),
+    })
+}
+
+fn parse_modbus_config(root: &Value) -> Option<ModbusConfig> {
+    let section = get(root, "meta").and_then(|m| get(m, "modbus"))?;
+    let register_base = match as_i64(section, "register_base") {
+        Some(0) => Some(0),
+        Some(1) => Some(1),
+        _ => None,
+    };
+    let cfg = ModbusConfig {
+        device_address: as_i64(section, "device_address").and_then(|i| u8::try_from(i).ok()),
+        register_base,
+        default_interval: as_i64(section, "default_interval").and_then(|i| u64::try_from(i).ok()),
+        default_byte_order: endianness_at(section, "default_byte_order")
+            .or_else(|| endianness_at(section, "byte_order")),
+        default_word_order: endianness_at(section, "default_word_order"),
+    };
+    if cfg == ModbusConfig::default() {
+        None
+    } else {
+        Some(cfg)
+    }
+}
+
+// ---------- modbus frame mapping (reuse ModbusManifest) ----------
+
+fn map_modbus_signal(s: &crate::modbus::ModbusSignal) -> Signal {
+    let enum_map = s.enum_map.as_ref().map(|m| {
+        m.iter()
+            .filter_map(|(k, v)| k.parse::<i64>().ok().map(|n| (n, v.clone())))
+            .collect::<BTreeMap<i64, String>>()
+    });
+    Signal {
+        name: Some(s.name.clone()),
+        start_bit: Some(s.start_bit),
+        bit_length: Some(s.bit_length),
+        signed: Some(s.signed),
+        endianness: s.byte_order,
+        word_order: s.word_order,
+        factor: s.factor,
+        offset: s.offset,
+        unit: s.unit.clone(),
+        min: None,
+        max: None,
+        format: s.format,
+        enum_map: enum_map.filter(|m| !m.is_empty()),
+        confidence: None,
+        inherited: false,
+    }
+}
+
+fn modbus_frames(text: &str) -> Vec<Frame> {
+    let manifest = match ModbusManifest::parse(text) {
+        Ok(m) => m,
+        Err(ManifestError::NoFrames) => return Vec::new(),
+        // A parse error here means the modbus section is malformed; CAN/serial
+        // frames still parse independently, so we just skip modbus frames.
+        Err(_) => return Vec::new(),
+    };
+    manifest
+        .frames
+        .iter()
+        .map(|f| {
+            let count = f.length;
+            let length = if matches!(f.register_type, RegisterType::Coil | RegisterType::Discrete) {
+                (count as u32).div_ceil(8)
+            } else {
+                count as u32 * 2
+            };
+            Frame {
+                frame_id: f.register_number as u32,
+                protocol: Protocol::Modbus,
+                name: Some(f.name.clone()),
+                length,
+                transmitter: None,
+                // ModbusFrame.interval_ms is already resolved (frame tx → meta
+                // default → built-in default).
+                interval: Some(f.interval_ms),
+                bus: None,
+                is_extended: None,
+                is_fd: None,
+                signals: f.signals.iter().map(map_modbus_signal).collect(),
+                mux: None,
+                mirror_of: None,
+                copy_from: None,
+                modbus_register_type: Some(f.register_type),
+                modbus_register_count: Some(f.length),
+            }
+        })
+        .collect()
+}
+
+// ---------- top-level ----------
+
+impl Catalog {
+    /// Parse a TOML catalogue into the resolved model. Mirrors
+    /// `parseCatalogText`.
+    pub fn parse(text: &str) -> Result<Catalog, CatalogError> {
+        let root: Value = toml::from_str(text)?;
+
+        let meta = Meta {
+            name: get(&root, "meta")
+                .and_then(|m| as_str(m, "name"))
+                .unwrap_or("")
+                .to_string(),
+            version: get(&root, "meta")
+                .and_then(|m| as_u32(m, "version"))
+                .unwrap_or(1),
+            default_frame: get(&root, "meta")
+                .and_then(|m| as_str(m, "default_frame"))
+                .and_then(|p| match p {
+                    "can" => Some(Protocol::Can),
+                    "serial" => Some(Protocol::Serial),
+                    "modbus" => Some(Protocol::Modbus),
+                    _ => None,
+                }),
+        };
+
+        let can = parse_can_config(&root);
+        let serial = parse_serial_config(&root);
+        let modbus = parse_modbus_config(&root);
+
+        let empty = Value::Table(Default::default());
+        let can_frames = get(&root, "frame")
+            .and_then(|f| get(f, "can"))
+            .unwrap_or(&empty);
+        let serial_frames = get(&root, "frame")
+            .and_then(|f| get(f, "serial"))
+            .unwrap_or(&empty);
+        let modbus_frames_section = get(&root, "frame")
+            .and_then(|f| get(f, "modbus"))
+            .unwrap_or(&empty);
+
+        let mut frames: Vec<Frame> = Vec::new();
+
+        // CAN frames.
+        if let Some(table) = can_frames.as_table() {
+            for (id_key, body) in table {
+                if id_key == "config" {
+                    continue;
+                }
+                let Some(num_id) = parse_id(id_key) else {
+                    continue;
+                };
+                let resolved = resolve_mirror_inheritance(body, can_frames);
+                let length = as_u32(body, "length")
+                    .or(resolved.inherited.length)
+                    .unwrap_or(8);
+                let is_extended = as_bool(body, "extended")
+                    .or(can.as_ref().and_then(|c| c.default_extended))
+                    .unwrap_or(num_id > 0x7ff);
+                let is_fd = as_bool(body, "fd")
+                    .or(can.as_ref().and_then(|c| c.default_fd))
+                    .unwrap_or(false);
+                frames.push(Frame {
+                    frame_id: num_id,
+                    protocol: Protocol::Can,
+                    name: None,
+                    length,
+                    transmitter: as_str(body, "transmitter")
+                        .map(str::to_string)
+                        .or(resolved.inherited.transmitter),
+                    interval: frame_interval(body).or(resolved.inherited.interval),
+                    bus: as_u32(body, "bus"),
+                    is_extended: Some(is_extended),
+                    is_fd: Some(is_fd),
+                    signals: resolved.signals,
+                    mux: resolved.mux,
+                    mirror_of: resolved.mirror_of,
+                    copy_from: resolved.copy_from,
+                    modbus_register_type: None,
+                    modbus_register_count: None,
+                });
+            }
+        }
+
+        // Serial frames (no inheritance).
+        if let Some(table) = serial_frames.as_table() {
+            for (id_key, body) in table {
+                if id_key == "config" {
+                    continue;
+                }
+                let Some(num_id) = parse_id(id_key) else {
+                    continue;
+                };
+                frames.push(Frame {
+                    frame_id: num_id,
+                    protocol: Protocol::Serial,
+                    name: None,
+                    length: as_u32(body, "length").unwrap_or(0),
+                    transmitter: as_str(body, "transmitter").map(str::to_string),
+                    interval: frame_interval(body),
+                    bus: as_u32(body, "bus"),
+                    is_extended: None,
+                    is_fd: None,
+                    signals: normalise_signals(get(body, "signals")),
+                    mux: parse_mux(get(body, "mux")),
+                    mirror_of: None,
+                    copy_from: None,
+                    modbus_register_type: None,
+                    modbus_register_count: None,
+                });
+            }
+        }
+
+        // Modbus frames (reuse ModbusManifest for shorthands).
+        frames.extend(modbus_frames(text));
+
+        // Protocol determination (mirror TS).
+        let has = |section: &Value| {
+            section
+                .as_table()
+                .map(|t| t.keys().any(|k| k != "config"))
+                .unwrap_or(false)
+        };
+        let has_can = has(can_frames);
+        let has_serial = has(serial_frames);
+        let has_modbus = has(modbus_frames_section);
+        let protocol = match meta.default_frame {
+            Some(p) => p,
+            None if has_modbus && !has_can && !has_serial => Protocol::Modbus,
+            None if has_serial && !has_can => Protocol::Serial,
+            None => Protocol::Can,
+        };
+
+        Ok(Catalog {
+            meta,
+            protocol,
+            can,
+            serial,
+            modbus,
+            frames,
+        })
+    }
+
+    /// Find a parsed frame by its numeric id.
+    pub fn frame(&self, id: u32) -> Option<&Frame> {
+        self.frames.iter().find(|f| f.frame_id == id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sig<'a>(f: &'a Frame, name: &str) -> &'a Signal {
+        f.signals
+            .iter()
+            .find(|s| s.name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("signal {name} present"))
+    }
+
+    #[test]
+    fn parses_can_frame_with_signal_and_defaults() {
+        let toml = r#"
+[meta]
+name = "Test"
+version = 1
+
+[meta.can]
+default_byte_order = "little"
+
+[frame.can.0x123]
+length = 8
+transmitter = "ECU1"
+tx.interval_ms = 100
+
+[[frame.can.0x123.signals]]
+name = "RPM"
+start_bit = 0
+bit_length = 16
+factor = 0.25
+unit = "rpm"
+byte_order = "big"
+"#;
+        let c = Catalog::parse(toml).unwrap();
+        assert_eq!(c.protocol, Protocol::Can);
+        assert_eq!(c.meta.name, "Test");
+        assert_eq!(
+            c.can.as_ref().unwrap().default_byte_order,
+            Some(Endianness::Little)
+        );
+        let f = c.frame(0x123).unwrap();
+        assert_eq!(f.length, 8);
+        assert_eq!(f.transmitter.as_deref(), Some("ECU1"));
+        assert_eq!(f.interval, Some(100));
+        assert_eq!(f.is_extended, Some(false)); // 0x123 <= 0x7ff
+        assert_eq!(f.is_fd, Some(false));
+        let s = sig(f, "RPM");
+        assert_eq!(s.start_bit, Some(0));
+        assert_eq!(s.bit_length, Some(16));
+        assert_eq!(s.factor, Some(0.25));
+        // byte_order key maps onto endianness.
+        assert_eq!(s.endianness, Some(Endianness::Big));
+    }
+
+    #[test]
+    fn extended_auto_detected_and_overridable() {
+        let toml = r#"
+[meta]
+name = "x"
+[frame.can.0x1ABCDE]
+length = 8
+[frame.can.0x100]
+length = 8
+extended = true
+"#;
+        let c = Catalog::parse(toml).unwrap();
+        assert_eq!(c.frame(0x1ABCDE).unwrap().is_extended, Some(true)); // > 0x7ff
+        assert_eq!(c.frame(0x100).unwrap().is_extended, Some(true)); // explicit
+    }
+
+    #[test]
+    fn default_extended_and_fd_from_config() {
+        let toml = r#"
+[meta]
+name = "x"
+[meta.can]
+default_extended = true
+default_fd = true
+[frame.can.0x10]
+length = 8
+"#;
+        let c = Catalog::parse(toml).unwrap();
+        let f = c.frame(0x10).unwrap();
+        assert_eq!(f.is_extended, Some(true)); // config default beats auto-detect
+        assert_eq!(f.is_fd, Some(true));
+    }
+
+    #[test]
+    fn mirror_inherits_signals_and_marks_inherited() {
+        let toml = r#"
+[meta]
+name = "x"
+
+[frame.can.0x100]
+length = 8
+[[frame.can.0x100.signals]]
+name = "A"
+start_bit = 0
+bit_length = 8
+[[frame.can.0x100.signals]]
+name = "B"
+start_bit = 8
+bit_length = 8
+
+[frame.can.0x200]
+mirror_of = "0x100"
+[[frame.can.0x200.signals]]
+name = "B_override"
+start_bit = 8
+bit_length = 8
+"#;
+        let c = Catalog::parse(toml).unwrap();
+        let f = c.frame(0x200).unwrap();
+        assert_eq!(f.mirror_of.as_deref(), Some("0x100"));
+        // A inherited from primary (same position, no override).
+        let a = sig(f, "A");
+        assert!(a.inherited);
+        // Position 8:8 overridden by the mirror's own signal.
+        let b = sig(f, "B_override");
+        assert!(!b.inherited);
+        // Length inherited from the mirror source.
+        assert_eq!(f.length, 8);
+    }
+
+    #[test]
+    fn copy_inherits_metadata_only() {
+        let toml = r#"
+[meta]
+name = "x"
+[frame.can.0x100]
+length = 6
+transmitter = "ECU"
+tx.interval_ms = 250
+[frame.can.0x200]
+copy = "0x100"
+[[frame.can.0x200.signals]]
+name = "S"
+start_bit = 0
+bit_length = 8
+"#;
+        let c = Catalog::parse(toml).unwrap();
+        let f = c.frame(0x200).unwrap();
+        assert_eq!(f.copy_from.as_deref(), Some("0x100"));
+        assert_eq!(f.length, 6);
+        assert_eq!(f.transmitter.as_deref(), Some("ECU"));
+        assert_eq!(f.interval, Some(250));
+        // copy carries metadata only — signals are the frame's own.
+        assert_eq!(f.signals.len(), 1);
+        assert!(!sig(f, "S").inherited);
+    }
+
+    #[test]
+    fn parses_mux_with_ranges_lists_and_nesting() {
+        let toml = r#"
+[meta]
+name = "x"
+[frame.can.0x300]
+length = 8
+[frame.can.0x300.mux]
+name = "sel"
+start_bit = 0
+bit_length = 8
+[[frame.can.0x300.mux."0-3".signals]]
+name = "low"
+start_bit = 8
+bit_length = 8
+[[frame.can.0x300.mux."4,5".signals]]
+name = "mid"
+start_bit = 8
+bit_length = 8
+[frame.can.0x300.mux."6".mux]
+name = "inner"
+start_bit = 16
+bit_length = 4
+[[frame.can.0x300.mux."6".mux."0".signals]]
+name = "deep"
+start_bit = 24
+bit_length = 8
+"#;
+        let c = Catalog::parse(toml).unwrap();
+        let m = c.frame(0x300).unwrap().mux.as_ref().unwrap();
+        assert_eq!(m.name.as_deref(), Some("sel"));
+        assert!(m.cases.contains_key("0-3"));
+        assert!(m.cases.contains_key("4,5"));
+        let nested = m.cases.get("6").unwrap().mux.as_ref().unwrap();
+        assert_eq!(nested.name.as_deref(), Some("inner"));
+        assert_eq!(
+            nested.cases.get("0").unwrap().signals[0].name.as_deref(),
+            Some("deep")
+        );
+    }
+
+    #[test]
+    fn parses_serial_config_and_frames() {
+        let toml = r#"
+[meta]
+name = "ser"
+[meta.serial]
+encoding = "slip"
+byte_order = "big"
+
+[meta.serial.checksum]
+algorithm = "crc16"
+start_byte = 6
+byte_length = 2
+
+[meta.serial.fields]
+id = { start_byte = 0, bytes = 2 }
+
+[frame.serial.0xFDE0]
+length = 8
+[[frame.serial.0xFDE0.signals]]
+name = "V"
+start_bit = 0
+bit_length = 16
+"#;
+        let c = Catalog::parse(toml).unwrap();
+        assert_eq!(c.protocol, Protocol::Serial);
+        let s = c.serial.as_ref().unwrap();
+        assert_eq!(s.encoding.as_deref(), Some("slip"));
+        assert_eq!(s.byte_order, Some(Endianness::Big));
+        assert_eq!(s.checksum.as_ref().unwrap().algorithm, "crc16");
+        assert_eq!(s.checksum.as_ref().unwrap().byte_length, 2);
+        // legacy start_byte/bytes → mask 0xFFFF for the first two bytes.
+        assert_eq!(s.fields.get("id").unwrap().mask, 0xFFFF);
+        assert_eq!(c.frame(0xFDE0).unwrap().signals.len(), 1);
+    }
+
+    #[test]
+    fn reuses_modbus_shorthands() {
+        let toml = r#"
+[meta]
+name = "mb"
+[meta.modbus]
+register_base = 0
+default_word_order = "little"
+
+[frame.modbus.0x138F]
+register_type = "input"
+length = 1
+name = "Inverter_Temperature"
+factor = 0.1
+unit = "C"
+"#;
+        let c = Catalog::parse(toml).unwrap();
+        assert_eq!(c.protocol, Protocol::Modbus);
+        assert_eq!(
+            c.modbus.as_ref().unwrap().default_word_order,
+            Some(Endianness::Little)
+        );
+        let f = c.frame(0x138F).unwrap();
+        // register-from-key + signal-less shorthands resolved by ModbusManifest.
+        assert_eq!(f.modbus_register_type, Some(RegisterType::Input));
+        assert_eq!(f.modbus_register_count, Some(1));
+        assert_eq!(f.length, 2); // 1 register = 2 bytes
+        let s = sig(f, "Inverter_Temperature");
+        assert_eq!(s.factor, Some(0.1));
+        assert_eq!(s.bit_length, Some(16));
+    }
+
+    #[test]
+    fn protocol_defaults_to_can_and_respects_default_frame() {
+        let mixed = r#"
+[meta]
+name = "x"
+default_frame = "serial"
+[frame.can.0x1]
+length = 8
+[frame.serial.0x2]
+length = 8
+"#;
+        assert_eq!(Catalog::parse(mixed).unwrap().protocol, Protocol::Serial);
+
+        let only_can = "[meta]\nname='x'\n[frame.can.0x1]\nlength=8\n";
+        assert_eq!(Catalog::parse(only_can).unwrap().protocol, Protocol::Can);
+    }
+
+    #[test]
+    fn invalid_toml_errors() {
+        assert!(matches!(
+            Catalog::parse("not = valid = toml ="),
+            Err(CatalogError::Toml(_))
+        ));
+    }
+
+    #[test]
+    fn round_trips_through_json() {
+        let toml = r#"
+[meta]
+name = "x"
+[frame.can.0x123]
+length = 8
+[[frame.can.0x123.signals]]
+name = "A"
+start_bit = 0
+bit_length = 8
+"#;
+        let c = Catalog::parse(toml).unwrap();
+        let json = serde_json::to_string(&c).unwrap();
+        let back: Catalog = serde_json::from_str(&json).unwrap();
+        assert_eq!(c, back);
+    }
+}

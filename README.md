@@ -1,25 +1,66 @@
 # wiretap-catalog
 
-Parser, decoder, and writer for **WireTAP-format Modbus device catalogues** (TOML).
+The canonical parser, validator, decoder, and writer for **WireTAP-format device
+catalogues** (TOML) — across **CAN, Serial, and Modbus**.
 
-A device catalogue describes the Modbus registers of a device (an inverter, a
-battery, a meter) and how to decode them. The same `[frame.modbus.*]` schema is
-used by [WireTAP](https://github.com/Wired-Square) and the Home Assistant ESS
-add-on; this crate is the shared, versioned implementation so both consume one
-source of truth.
+A device catalogue describes a device's frames/registers and how to decode them
+(an inverter, a battery, a meter, a CAN ECU). The same schema is used by
+[WireTAP](https://github.com/Wired-Square) and the Home Assistant ESS add-on;
+this crate is the shared, versioned implementation so they consume one source of
+truth — and so decoding can happen once, in Rust, instead of being re-implemented
+per consumer.
+
+```rust
+use wiretap_catalog::{Catalog, decode, validate};
+
+// Parse any protocol (CAN / Serial / Modbus) into one resolved model.
+let cat = Catalog::parse(toml_text)?;          // shorthands + mirror/copy resolved
+let errors = validate::validate(toml_text);    // field-path + message findings
+
+// Decode a frame's bytes → signal values (factor/offset, endian, mux, formats).
+let frame = cat.frame(0x123).unwrap();
+let out = decode::decode_frame(&cat, frame, &bytes);
+for s in &out.signals {
+    println!("{} = {} {}", s.name, s.display, s.unit.as_deref().unwrap_or(""));
+}
+```
+
+The Modbus model is also available directly (`wiretap_catalog::modbus`) for the
+register-poll/encode workflow.
+
+## Capabilities
+
+- **Parse** — `Catalog::parse` resolves CAN, Serial and Modbus frame sections
+  into one [`Catalog`] model: mirror/copy inheritance, header-field masks, mux
+  trees, and the Modbus authoring shorthands (below).
+- **Validate** — `validate::validate` returns `{ field, message }` findings
+  (meta/CAN signal & mux rules, DBC-name compatibility, Modbus register
+  resolution).
+- **Decode** — `decode::decode_frame` turns raw bytes into signal values:
+  16/64-bit signed/unsigned, `factor`/`offset`, byte + word order (Sungrow
+  "CDAB"), `enum`/`hex`/`ascii`/`utf8`/`unix_time` formats, and mux selection
+  (single / range `0-3` / list `1,2,5` / nested). One implementation — the
+  Modbus register decoder shares the same bit-extraction core.
+- **Encode** (Modbus) — values → register writes (inverse of decode): masked
+  bit-fields, register-contiguous batching, `register_type` writability check.
+- **DBC** — import a Vector `.dbc` to catalogue TOML and export back
+  (`dbc::convert_dbc_to_toml`, `dbc::render_catalog_as_dbc_with_mode`), including
+  extended (`SG_MUL_VAL_`) and flattened multiplex modes.
+- **Edit** — toggle a Modbus frame's `disabled` flag in place via `toml_edit`,
+  preserving comments and formatting.
 
 ```toml
+[meta]
+name = "Sungrow SHx"
+
 [meta.modbus]
-device_address = 1
 register_base = 0            # 0 = IEC/0-based, 1 = traditional 3xxxx/4xxxx
-default_interval = 5000      # ms
 default_word_order = "little"
 
 [frame.modbus.battery_status]   # one Modbus read of a register block
 register_number = 13019
 register_type = "input"         # input | holding | coil | discrete
 length = 9                      # register count
-tx.interval_ms = 10000
 
 [[frame.modbus.battery_status.signals]]   # a bit-slice of the block
 name = "Battery_SoC"
@@ -29,68 +70,41 @@ factor = 0.1
 unit = "%"
 ```
 
-```rust
-use wiretap_catalog::modbus::{ModbusManifest, decode_frame};
-
-let m = ModbusManifest::parse(toml_text)?;
-let frame = &m.frames[0];
-let values = decode_frame(frame, &registers, &m.meta); // (name, scaled value, unit)
-```
-
-## Capabilities
-
-- **Parse** the catalogue model (frames, signals, meta) with serde.
-- **Decode** register blocks → scaled values: 16/32/64-bit signed/unsigned,
-  `factor`/`offset`, byte order, and multi-register word-swap (Sungrow "CDAB").
-  String-ish formats (`ascii`/`hex`/`utf8`/`unix_time`) are skipped by the
-  numeric decoder.
-- **Encode** values → register writes (the inverse), with masked bit-fields,
-  register-contiguous batching, and a `register_type` writability check.
-- **Edit** a frame's `disabled` flag in place via `toml_edit`, preserving the
-  manifest's comments and formatting.
-
-### Shorthands
-
-Two authoring conveniences on top of the base schema:
+### Modbus shorthands
 
 - **Register from the key** — omit `register_number` and name the frame by its
   register: `[frame.modbus.0x32F9]` or `[frame.modbus.13049]`. An explicit
   `register_number` still wins.
 - **Signal-less register** — a register that *is* a single value needs no
   `[[signals]]` block; put the decoding fields at the frame level and one
-  full-width signal (`length × 16` bits) is synthesised:
-
-  ```toml
-  [frame.modbus.0x138F]
-  register_type = "input"
-  length = 1
-  name = "Inverter_Temperature"
-  factor = 0.1
-  unit = "°C"
-  ```
+  full-width signal (`length × 16` bits) is synthesised.
 
 ## Versioning
 
 Released as git tags (`vMAJOR.MINOR.PATCH`); consumers pin a tag:
 
 ```toml
-wiretap-catalog = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.1.0" }
+wiretap-catalog = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.2.0" }
 ```
+
+Dev loop: pin the tag, but add a local `[patch]`/`path` override against a working
+checkout while iterating, so changes don't need a push/tag to test. Bump the
+version + tag a new `vX.Y.Z` to release.
 
 ## Status & roadmap
 
-- **v0.1.0** — Modbus catalogue parse / decode / encode, both shorthands above,
-  31 tests, CI (fmt · clippy `-D warnings` · test). Extracted from the Home
-  Assistant ESS add-on so it and WireTAP can share one implementation.
-- **Next:** WireTAP's `src-tauri` moves Modbus poll-building onto this crate
-  (the backend parses the catalogue and owns the polls; a `parse_modbus_catalog`
-  command hands the resolved model — shorthands applied — to the frontend, which
-  keeps decoding in TS for now). Then the ESS add-on drops its private
-  `manifest.rs` and depends on this crate.
-
-Dev loop: pin the tag in `Cargo.toml`, but add a local `[patch]`/`path` override
-against a working checkout while iterating, so changes don't need a push/tag to
-test. Bump the version + tag a new `vX.Y.Z` to release.
+- **v0.2.0** — grown from Modbus-only into the canonical catalogue library:
+  unified `Catalog` model, `Catalog::parse` (CAN + Serial + Modbus), `validate`,
+  `decode::decode_frame` (ported from WireTAP's `bits.ts`/`signalDecode.ts`/
+  `muxCaseMatch.ts`, single-sourced with the Modbus decoder), and DBC
+  import/export. 80 tests, CI (fmt · clippy `-D warnings` · test).
+- **v0.1.0** — Modbus catalogue parse / decode / encode + shorthands. Extracted
+  from the Home Assistant ESS add-on.
+- **Next (in WireTAP):** the backend exposes the crate over the binary WebSocket
+  — a `catalog.*` command surface (parse/validate/serialise/DBC) for the editor,
+  and decode-on-attach streaming a new `DecodedSignals` message so the frontend
+  stops re-decoding every frame. Then the TS decode engine and the duplicate TS
+  catalogue parser are removed.
 
 ## Licence
 

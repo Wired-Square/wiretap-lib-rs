@@ -52,6 +52,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::decode::{apply_word_swap, extract_bits};
+use crate::model::{Endianness, RegisterType, SignalFormat};
+
 /// Poll interval used when neither the frame nor `[meta.modbus]` sets one.
 const DEFAULT_INTERVAL_MS: u64 = 5000;
 
@@ -63,68 +66,6 @@ pub enum ManifestError {
     NoFrames,
     #[error("frame '{0}' has no register_number and its name is not a register address (decimal or 0x-hex)")]
     BadRegister(String),
-}
-
-/// Byte / word ordering. `Big` is the standard Modbus convention
-/// (high-order first); `Little` is word-swapped for multi-register
-/// values (Sungrow's "CDAB").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Endianness {
-    Big,
-    Little,
-}
-
-/// Modbus register class — determines the function code the poller uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RegisterType {
-    Input,
-    #[default]
-    Holding,
-    Coil,
-    Discrete,
-}
-
-impl RegisterType {
-    /// Read-only telemetry only reads register banks (input/holding);
-    /// coil/discrete are parsed but not polled in v1.
-    pub fn is_register_bank(self) -> bool {
-        matches!(self, RegisterType::Input | RegisterType::Holding)
-    }
-
-    /// Whether this register class can be written. In Modbus, `holding`
-    /// (FC06/16) and `coil` (FC05/15) are read/write; `input` (FC04) and
-    /// `discrete` (FC02) are read-only. `register_type` is therefore the
-    /// "can we write this" test — no separate flag is needed.
-    pub fn is_writable(self) -> bool {
-        matches!(self, RegisterType::Holding | RegisterType::Coil)
-    }
-
-    /// Lowercase tag, matching the manifest spelling.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            RegisterType::Input => "input",
-            RegisterType::Holding => "holding",
-            RegisterType::Coil => "coil",
-            RegisterType::Discrete => "discrete",
-        }
-    }
-}
-
-/// A signal's data format. Any value here marks the signal as
-/// non-numeric (string/opaque) — the decoder skips it and the role
-/// pickers don't offer it. Absent = a plain scaled number.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SignalFormat {
-    Ascii,
-    Utf8,
-    Hex,
-    Enum,
-    UnixTime,
-    #[serde(other)]
-    Other,
 }
 
 /// A single decoded field within a frame's register block.
@@ -668,88 +609,9 @@ fn registers_to_bytes(regs: &[u16]) -> Vec<u8> {
     bytes
 }
 
-/// Swap 16-bit words within a signal's byte span (low-word-first →
-/// high-word-first) before big-endian extraction. Mirrors the
-/// word-swap in WireTAP's `decodeSignal`.
-fn apply_word_swap(bytes: &mut [u8], start_bit: u32, bit_length: u32) {
-    let start_byte = (start_bit / 8) as usize;
-    let num_bytes = bit_length.div_ceil(8) as usize;
-    let num_words = num_bytes.div_ceil(2);
-    let mut words: Vec<(u8, u8)> = Vec::with_capacity(num_words);
-    for i in 0..num_words {
-        let idx = start_byte + i * 2;
-        let a = bytes.get(idx).copied().unwrap_or(0);
-        let b = bytes.get(idx + 1).copied().unwrap_or(0);
-        words.push((a, b));
-    }
-    words.reverse();
-    for (i, (a, b)) in words.into_iter().enumerate() {
-        let idx = start_byte + i * 2;
-        if idx < bytes.len() {
-            bytes[idx] = a;
-        }
-        if idx + 1 < bytes.len() {
-            bytes[idx + 1] = b;
-        }
-    }
-}
-
-/// Extract a bitfield as an `f64`, honouring endianness and sign.
-/// Faithful port of WireTAP's `extractBits` (i128 accumulator covers up
-/// to 64-bit numeric signals without precision loss).
-fn extract_bits(
-    bytes: &[u8],
-    start_bit: u32,
-    bit_length: u32,
-    endian: Endianness,
-    signed: bool,
-) -> f64 {
-    if bit_length == 0 {
-        return 0.0;
-    }
-    // Expand to a flat bit list in the byte order's reading direction.
-    let mut bits: Vec<u8> = Vec::with_capacity(bytes.len() * 8);
-    match endian {
-        Endianness::Big => {
-            for &b in bytes {
-                for k in (0..8).rev() {
-                    bits.push((b >> k) & 1);
-                }
-            }
-        }
-        Endianness::Little => {
-            for &b in bytes {
-                for k in 0..8 {
-                    bits.push((b >> k) & 1);
-                }
-            }
-        }
-    }
-    let start = (start_bit as usize).min(bits.len());
-    let end = (start + bit_length as usize).min(bits.len());
-    let slice = &bits[start..end];
-
-    let mut value: i128 = 0;
-    match endian {
-        Endianness::Big => {
-            for &bit in slice {
-                value = (value << 1) | bit as i128;
-            }
-        }
-        Endianness::Little => {
-            for &bit in slice.iter().rev() {
-                value = (value << 1) | bit as i128;
-            }
-        }
-    }
-    if signed {
-        let sign_bit: i128 = 1 << (bit_length - 1);
-        if value & sign_bit != 0 {
-            value -= 1 << bit_length;
-        }
-    }
-    value as f64
-}
+// `apply_word_swap` and `extract_bits` are the shared bit-extraction core,
+// now in `crate::decode` (imported above) so the streaming decoder and this
+// Modbus decoder stay byte-for-byte identical.
 
 // ---------- raw serde shapes (TOML wire format) ----------
 
