@@ -1,0 +1,17 @@
+[package]
+name = "wiretap-catalog"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Parser, decoder, and writer for WireTAP-format Modbus device catalogues (TOML)."
+repository = "https://github.com/Wired-Square/wiretap-lib-rs"
+readme = "README.md"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+toml_edit = "0.22"
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"
