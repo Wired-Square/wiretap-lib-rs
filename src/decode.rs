@@ -24,6 +24,9 @@ pub struct Decoded {
     /// For a signal from a mux case, the selector value of its mux (so consumers
     /// can track each mux case's signals separately). `None` for plain signals.
     pub mux_value: Option<i64>,
+    /// The signal's declared format (enum/hex/ascii/…), carried through for the
+    /// UI's per-format rendering. `None` for a plain numeric signal.
+    pub format: Option<SignalFormat>,
 }
 
 /// A mux selector reading + the case it matched.
@@ -219,6 +222,7 @@ pub fn decode_signal(
         display,
         unit,
         mux_value: None,
+        format: sig.format,
     }
 }
 
