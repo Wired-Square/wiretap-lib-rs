@@ -77,6 +77,21 @@ Released as git tags (`vMAJOR.MINOR.PATCH`); consumers pin a tag:
 wiretap-catalog = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.1.0" }
 ```
 
+## Status & roadmap
+
+- **v0.1.0** — Modbus catalogue parse / decode / encode, both shorthands above,
+  31 tests, CI (fmt · clippy `-D warnings` · test). Extracted from the Home
+  Assistant ESS add-on so it and WireTAP can share one implementation.
+- **Next:** WireTAP's `src-tauri` moves Modbus poll-building onto this crate
+  (the backend parses the catalogue and owns the polls; a `parse_modbus_catalog`
+  command hands the resolved model — shorthands applied — to the frontend, which
+  keeps decoding in TS for now). Then the ESS add-on drops its private
+  `manifest.rs` and depends on this crate.
+
+Dev loop: pin the tag in `Cargo.toml`, but add a local `[patch]`/`path` override
+against a working checkout while iterating, so changes don't need a push/tag to
+test. Bump the version + tag a new `vX.Y.Z` to release.
+
 ## Licence
 
 MIT © Wired Square.
