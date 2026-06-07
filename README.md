@@ -84,7 +84,7 @@ unit = "%"
 Released as git tags (`vMAJOR.MINOR.PATCH`); consumers pin a tag:
 
 ```toml
-wiretap-catalog = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.2.0" }
+wiretap-catalog = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.3.0" }
 ```
 
 Dev loop: pin the tag, but add a local `[patch]`/`path` override against a working
@@ -93,6 +93,10 @@ version + tag a new `vX.Y.Z` to release.
 
 ## Status & roadmap
 
+- **v0.3.0** — `decode::decode_by_id` (apply `frame_id_mask`, look up the frame,
+  decode signals/mux **and** extract header fields — CAN from the id, serial from
+  the header bytes — plus source-address resolution). This is what the live
+  stream calls per frame.
 - **v0.2.0** — grown from Modbus-only into the canonical catalogue library:
   unified `Catalog` model, `Catalog::parse` (CAN + Serial + Modbus), `validate`,
   `decode::decode_frame` (ported from WireTAP's `bits.ts`/`signalDecode.ts`/

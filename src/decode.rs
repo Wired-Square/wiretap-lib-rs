@@ -33,11 +33,27 @@ pub struct MuxSelector {
     pub bit_length: u32,
 }
 
-/// The full decode of one frame: its signals plus any mux selector readings.
+/// A header field extracted from the CAN id (mask + shift) or serial header
+/// bytes (mask → byte range). Mirrors the TS `HeaderFieldValue`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeaderFieldValue {
+    pub name: String,
+    pub value: u64,
+    pub display: String,
+    /// `hex` or `decimal`.
+    pub format: String,
+}
+
+/// The full decode of one frame: its signals, mux selector readings, and the
+/// header fields extracted from the id/header bytes.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct FrameDecode {
     pub signals: Vec<Decoded>,
     pub selectors: Vec<MuxSelector>,
+    pub header_fields: Vec<HeaderFieldValue>,
+    /// Source address resolved from a CAN header field (source_address / sender
+    /// / source / src / sa), when present.
+    pub source_address: Option<u64>,
 }
 
 // ---------- bit extraction (shared with modbus) ----------
@@ -448,6 +464,123 @@ fn decode_mux(
     }
 }
 
+/// Decode a frame from its raw id + bytes: apply the protocol's `frame_id_mask`
+/// to look up the catalogue frame, decode its signals/mux, and extract header
+/// fields (CAN: from the raw id; serial: from the header bytes). Returns `None`
+/// when no catalogue frame matches. This is the entry point the live stream uses.
+pub fn decode_by_id(catalog: &Catalog, raw_frame_id: u32, bytes: &[u8]) -> Option<FrameDecode> {
+    let masked = masked_frame_id(catalog, raw_frame_id);
+    let frame = catalog.frame(masked)?;
+    let mut out = decode_frame(catalog, frame, bytes);
+    extract_header_fields(catalog, raw_frame_id, bytes, &mut out);
+    Some(out)
+}
+
+/// Apply the protocol's `frame_id_mask` (if any) before catalogue lookup, so a
+/// catalogue keyed by message-type-only (e.g. J1939 PGN) matches frames that
+/// carry extra id bits. Mirrors `decoderStore`'s `maskedFrameId`.
+fn masked_frame_id(catalog: &Catalog, raw: u32) -> u32 {
+    let mask = match catalog.protocol {
+        Protocol::Can => catalog.can.as_ref().and_then(|c| c.frame_id_mask),
+        Protocol::Serial => catalog.serial.as_ref().and_then(|c| c.frame_id_mask),
+        Protocol::Modbus => None,
+    };
+    mask.map(|m| raw & m).unwrap_or(raw)
+}
+
+/// Extract header fields into `out` — CAN from the raw id (mask + shift), serial
+/// from the header bytes (mask → byte range). Port of `decoderStore`.
+fn extract_header_fields(catalog: &Catalog, raw_id: u32, bytes: &[u8], out: &mut FrameDecode) {
+    match catalog.protocol {
+        Protocol::Can => {
+            let Some(can) = &catalog.can else { return };
+            for (name, field) in &can.fields {
+                // Shift defaults to the mask's trailing-zero count.
+                let shift = field.shift.unwrap_or_else(|| {
+                    if field.mask > 0 {
+                        field.mask.trailing_zeros()
+                    } else {
+                        0
+                    }
+                });
+                let value = ((raw_id & field.mask) >> shift) as u64;
+                let format = field.format.clone().unwrap_or_else(|| "hex".to_string());
+                out.header_fields.push(HeaderFieldValue {
+                    name: name.clone(),
+                    value,
+                    display: format_header_value(value, &format),
+                    format,
+                });
+                if matches!(
+                    name.to_lowercase().as_str(),
+                    "source_address" | "sender" | "source" | "src" | "sa"
+                ) {
+                    out.source_address = Some(value);
+                }
+            }
+        }
+        Protocol::Serial => {
+            let Some(serial) = &catalog.serial else {
+                return;
+            };
+            for (name, field) in &serial.fields {
+                if name == "id" {
+                    continue;
+                }
+                let Some((start_byte, nbytes)) = mask_to_byte_position(field.mask) else {
+                    continue;
+                };
+                if start_byte >= bytes.len() {
+                    continue;
+                }
+                let end = (start_byte + nbytes).min(bytes.len());
+                let mut value: u64 = 0;
+                if field.endianness == Some(Endianness::Little) {
+                    for (i, b) in bytes[start_byte..end].iter().enumerate() {
+                        value |= (*b as u64) << (i * 8);
+                    }
+                } else {
+                    for b in &bytes[start_byte..end] {
+                        value = (value << 8) | *b as u64;
+                    }
+                }
+                // The mask is relative to the header start; shift it down to the field.
+                let shifted_mask = (field.mask as u64) >> (start_byte * 8);
+                value &= shifted_mask;
+                let format = field.format.clone().unwrap_or_else(|| "hex".to_string());
+                out.header_fields.push(HeaderFieldValue {
+                    name: name.clone(),
+                    value,
+                    display: format_header_value(value, &format),
+                    format,
+                });
+            }
+        }
+        Protocol::Modbus => {}
+    }
+}
+
+fn format_header_value(value: u64, format: &str) -> String {
+    if format == "decimal" {
+        value.to_string()
+    } else {
+        format!("0x{value:X}")
+    }
+}
+
+/// First set bit → byte position + byte span of a header-byte mask. Port of
+/// `maskToBytePosition`.
+fn mask_to_byte_position(mask: u32) -> Option<(usize, usize)> {
+    if mask == 0 {
+        return None;
+    }
+    let first = mask.trailing_zeros() as usize;
+    let last = 31 - mask.leading_zeros() as usize;
+    let start_byte = first / 8;
+    let end_byte = last / 8;
+    Some((start_byte, end_byte - start_byte + 1))
+}
+
 /// The default byte/word order to apply for a frame's protocol.
 fn frame_defaults(catalog: &Catalog, frame: &Frame) -> (Endianness, Option<Endianness>) {
     match frame.protocol {
@@ -675,6 +808,77 @@ unit = "W"
         assert_eq!(format_unix_time(1_609_459_200.0), "2021-01-01 00:00:00");
         // millisecond input auto-detected.
         assert_eq!(format_unix_time(1_609_459_200_000.0), "2021-01-01 00:00:00");
+    }
+
+    #[test]
+    fn can_header_fields_and_frame_id_mask() {
+        // J1939-style: catalogue keyed by PGN (id & mask); source address is the
+        // low byte, extracted from the raw id.
+        let c = parse(
+            r#"
+[meta]
+name = "x"
+[meta.can]
+frame_id_mask = 0x1FFFFF00
+[meta.can.fields]
+pgn = { mask = 0x1FFFFF00, format = "hex" }
+source_address = { mask = 0x000000FF, format = "decimal" }
+[frame.can.0x18EF0000]
+length = 8
+[[frame.can.0x18EF0000.signals]]
+name = "A"
+start_bit = 0
+bit_length = 8
+"#,
+        );
+        // Raw id has source 0x42 in the low byte; masked id matches the frame.
+        let d = decode_by_id(&c, 0x18EF0042, &[0x05, 0, 0, 0, 0, 0, 0, 0]).expect("decodes");
+        assert_eq!(d.source_address, Some(0x42));
+        let sa = d
+            .header_fields
+            .iter()
+            .find(|h| h.name == "source_address")
+            .unwrap();
+        assert_eq!(sa.value, 0x42);
+        assert_eq!(sa.display, "66"); // decimal format
+        let pgn = d.header_fields.iter().find(|h| h.name == "pgn").unwrap();
+        assert_eq!(pgn.value, 0x18EF00 >> 0); // (raw & mask) >> 8
+        assert_eq!(decoded(&d, "A").value, 5.0);
+        // Unmasked lookup would miss; decode_by_id applies the mask.
+        assert!(c.frame(0x18EF0042).is_none());
+    }
+
+    #[test]
+    fn serial_header_fields_from_bytes() {
+        let c = parse(
+            r#"
+[meta]
+name = "x"
+[meta.serial]
+[meta.serial.fields]
+length = { mask = 0x0000FF00, format = "decimal" }
+[frame.serial.0x10]
+length = 4
+[[frame.serial.0x10.signals]]
+name = "V"
+start_bit = 16
+bit_length = 8
+"#,
+        );
+        // bytes: [id=0x10, length=0x07, payload...]; the length field is byte 1.
+        let d = decode_by_id(&c, 0x10, &[0x10, 0x07, 0xAB, 0x00]).expect("decodes");
+        let len = d.header_fields.iter().find(|h| h.name == "length").unwrap();
+        assert_eq!(len.value, 0x07);
+        assert_eq!(len.display, "7");
+        assert_eq!(decoded(&d, "V").value, 0xAB as f64);
+    }
+
+    #[test]
+    fn mask_to_byte_position_spans() {
+        assert_eq!(mask_to_byte_position(0x000000FF), Some((0, 1)));
+        assert_eq!(mask_to_byte_position(0x0000FF00), Some((1, 1)));
+        assert_eq!(mask_to_byte_position(0x0000FFFF), Some((0, 2)));
+        assert_eq!(mask_to_byte_position(0), None);
     }
 
     #[test]
