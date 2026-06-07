@@ -93,6 +93,9 @@ version + tag a new `vX.Y.Z` to release.
 
 ## Status & roadmap
 
+- **v0.4.0** — each decoded mux-case signal carries its `mux_value` (the
+  selector value of its mux), so consumers can track each mux case's signals
+  independently.
 - **v0.3.0** — `decode::decode_by_id` (apply `frame_id_mask`, look up the frame,
   decode signals/mux **and** extract header fields — CAN from the id, serial from
   the header bytes — plus source-address resolution). This is what the live

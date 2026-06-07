@@ -21,6 +21,9 @@ pub struct Decoded {
     /// or the scaled number).
     pub display: String,
     pub unit: Option<String>,
+    /// For a signal from a mux case, the selector value of its mux (so consumers
+    /// can track each mux case's signals separately). `None` for plain signals.
+    pub mux_value: Option<i64>,
 }
 
 /// A mux selector reading + the case it matched.
@@ -181,55 +184,41 @@ pub fn decode_signal(
     let scaled = raw * factor + offset;
     let unit = sig.unit.clone();
 
-    match sig.format {
-        Some(SignalFormat::Hex) => Decoded {
-            name,
-            value: raw,
-            scaled,
-            display: format_hex(raw, len, endianness),
-            unit,
-        },
+    // Per-format display + the scaled/unit that actually apply (enum/text don't
+    // scale and carry no unit).
+    let (display, scaled, unit) = match sig.format {
+        Some(SignalFormat::Hex) => (format_hex(raw, len, endianness), scaled, unit),
         Some(SignalFormat::Enum) => {
             let label = sig
                 .enum_map
                 .as_ref()
                 .and_then(|m| m.get(&(raw as i64)).cloned());
-            Decoded {
-                name,
-                value: raw,
-                scaled: raw,
-                display: label.unwrap_or_else(|| format!("Unknown ({})", raw as i64)),
-                unit: None,
-            }
+            (
+                label.unwrap_or_else(|| format!("Unknown ({})", raw as i64)),
+                raw,
+                None,
+            )
         }
         Some(SignalFormat::Utf8) | Some(SignalFormat::Ascii) => {
             let text = decode_text(bytes, start, len);
-            Decoded {
-                name,
-                value: raw,
-                scaled: raw,
-                display: if text.is_empty() {
-                    "(empty)".to_string()
-                } else {
-                    text
-                },
-                unit: None,
-            }
+            let display = if text.is_empty() {
+                "(empty)".to_string()
+            } else {
+                text
+            };
+            (display, raw, None)
         }
-        Some(SignalFormat::UnixTime) => Decoded {
-            name,
-            value: raw,
-            scaled,
-            display: format_unix_time(scaled),
-            unit: None,
-        },
-        Some(SignalFormat::Other) | None => Decoded {
-            name,
-            value: raw,
-            scaled,
-            display: format_number(scaled),
-            unit,
-        },
+        Some(SignalFormat::UnixTime) => (format_unix_time(scaled), scaled, None),
+        Some(SignalFormat::Other) | None => (format_number(scaled), scaled, unit),
+    };
+
+    Decoded {
+        name,
+        value: raw,
+        scaled,
+        display,
+        unit,
+        mux_value: None,
     }
 }
 
@@ -450,13 +439,17 @@ fn decode_mux(
 
     if let Some(case) = matched.as_deref().and_then(|k| mux.cases.get(k)) {
         for (idx, sig) in case.signals.iter().enumerate() {
-            out.signals.push(decode_signal(
+            let mut decoded = decode_signal(
                 bytes,
                 sig,
                 &format!("Mux Signal {}", idx + 1),
                 default_endianness,
                 default_word_order,
-            ));
+            );
+            // Tag with this mux's selector value so consumers can track each
+            // mux case's signals separately.
+            decoded.mux_value = Some(selector);
+            out.signals.push(decoded);
         }
         if let Some(nested) = &case.mux {
             decode_mux(bytes, nested, default_endianness, default_word_order, out);
@@ -768,6 +761,8 @@ bit_length = 8
         assert_eq!(d.selectors[0].value, 2);
         assert_eq!(d.selectors[0].matched_case.as_deref(), Some("0-3"));
         assert_eq!(decoded(&d, "low").value, 0x37 as f64);
+        // Mux-case signals are tagged with their selector value.
+        assert_eq!(decoded(&d, "low").mux_value, Some(2));
         // selector = 5 → matches "4,5", not "0-3".
         let d2 = decode_frame(&c, f, &[5, 0x42, 0, 0, 0, 0, 0, 0]);
         assert_eq!(d2.selectors[0].matched_case.as_deref(), Some("4,5"));
