@@ -221,6 +221,21 @@ pub struct HeaderField {
     pub endianness: Option<Endianness>,
 }
 
+/// A serial header field with its byte position derived from the mask at parse
+/// time (so consumers don't re-derive it). One entry per `[meta.serial.fields]`
+/// field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeaderFieldPosition {
+    pub name: String,
+    pub mask: u32,
+    pub byte_order: Endianness,
+    /// `hex` or `decimal` display.
+    pub format: String,
+    pub start_byte: u32,
+    pub bytes: u32,
+}
+
 /// `[meta.can]` defaults.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -278,6 +293,24 @@ pub struct SerialConfig {
     pub checksum: Option<ChecksumConfig>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub fields: BTreeMap<String, HeaderField>,
+    // ── Derived from `fields` at parse time (byte positions of named fields) ──
+    /// Byte position of the `id` field, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_id_start_byte: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_id_bytes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_id_byte_order: Option<Endianness>,
+    /// Byte position of the `source_address` field, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_address_start_byte: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_address_bytes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_address_byte_order: Option<Endianness>,
+    /// One position entry per header field (the resolved form of `fields`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub header_fields: Vec<HeaderFieldPosition>,
 }
 
 /// `[meta.modbus]` defaults.

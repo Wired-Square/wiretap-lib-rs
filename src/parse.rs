@@ -415,16 +415,49 @@ fn parse_serial_config(root: &Value) -> Option<SerialConfig> {
         .map(str::to_string);
 
     let checksum = get(section, "checksum").and_then(parse_checksum);
+    let fields = parse_header_fields(get(section, "fields"), true);
 
-    let cfg = SerialConfig {
+    // Derive byte positions from the field masks once, here, so consumers
+    // (WireTAP's adapter, decode) don't each re-derive them.
+    let mut cfg = SerialConfig {
         encoding,
         byte_order: endianness_at(section, "byte_order"),
         frame_id_mask: as_u32(section, "frame_id_mask"),
         header_length: as_u32(section, "header_length"),
         min_frame_length: as_u32(section, "min_frame_length"),
         checksum,
-        fields: parse_header_fields(get(section, "fields"), true),
+        fields,
+        ..SerialConfig::default()
     };
+    for (name, field) in &cfg.fields {
+        let Some((start_byte, bytes)) = crate::decode::mask_to_byte_position(field.mask) else {
+            continue;
+        };
+        let (start_byte, bytes) = (start_byte as u32, bytes as u32);
+        let byte_order = field.endianness.unwrap_or(Endianness::Big);
+        cfg.header_fields.push(HeaderFieldPosition {
+            name: name.clone(),
+            mask: field.mask,
+            byte_order,
+            format: field.format.clone().unwrap_or_else(|| "hex".to_string()),
+            start_byte,
+            bytes,
+        });
+        match name.as_str() {
+            "id" => {
+                cfg.frame_id_start_byte = Some(start_byte);
+                cfg.frame_id_bytes = Some(bytes);
+                cfg.frame_id_byte_order = Some(byte_order);
+            }
+            "source_address" => {
+                cfg.source_address_start_byte = Some(start_byte);
+                cfg.source_address_bytes = Some(bytes);
+                cfg.source_address_byte_order = Some(byte_order);
+            }
+            _ => {}
+        }
+    }
+
     if cfg == SerialConfig::default() {
         None
     } else {
@@ -893,6 +926,7 @@ byte_length = 2
 
 [meta.serial.fields]
 id = { start_byte = 0, bytes = 2 }
+source_address = { start_byte = 2, bytes = 1 }
 
 [frame.serial.0xFDE0]
 length = 8
@@ -910,6 +944,17 @@ bit_length = 16
         assert_eq!(s.checksum.as_ref().unwrap().byte_length, 2);
         // legacy start_byte/bytes → mask 0xFFFF for the first two bytes.
         assert_eq!(s.fields.get("id").unwrap().mask, 0xFFFF);
+        // Byte positions derived from the masks at parse time.
+        assert_eq!(s.frame_id_start_byte, Some(0));
+        assert_eq!(s.frame_id_bytes, Some(2));
+        assert_eq!(s.frame_id_byte_order, Some(Endianness::Big));
+        assert_eq!(s.source_address_start_byte, Some(2));
+        assert_eq!(s.source_address_bytes, Some(1));
+        // One header_fields position entry per field (sorted by name in the map).
+        assert_eq!(s.header_fields.len(), 2);
+        let id_pos = s.header_fields.iter().find(|h| h.name == "id").unwrap();
+        assert_eq!((id_pos.start_byte, id_pos.bytes), (0, 2));
+        assert_eq!(id_pos.format, "hex");
         assert_eq!(c.frame(0xFDE0).unwrap().signals.len(), 1);
     }
 

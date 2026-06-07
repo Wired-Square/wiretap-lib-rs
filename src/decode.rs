@@ -566,8 +566,9 @@ fn format_header_value(value: u64, format: &str) -> String {
 }
 
 /// First set bit → byte position + byte span of a header-byte mask. Port of
-/// `maskToBytePosition`.
-fn mask_to_byte_position(mask: u32) -> Option<(usize, usize)> {
+/// `maskToBytePosition`. Shared with `parse` so the derived serial header
+/// positions are computed from the one algorithm.
+pub(crate) fn mask_to_byte_position(mask: u32) -> Option<(usize, usize)> {
     if mask == 0 {
         return None;
     }
@@ -841,7 +842,7 @@ bit_length = 8
         assert_eq!(sa.value, 0x42);
         assert_eq!(sa.display, "66"); // decimal format
         let pgn = d.header_fields.iter().find(|h| h.name == "pgn").unwrap();
-        assert_eq!(pgn.value, 0x18EF00 >> 0); // (raw & mask) >> 8
+        assert_eq!(pgn.value, 0x18EF00); // (raw & mask) >> 8
         assert_eq!(decoded(&d, "A").value, 5.0);
         // Unmasked lookup would miss; decode_by_id applies the mask.
         assert!(c.frame(0x18EF0042).is_none());

@@ -84,34 +84,33 @@ unit = "%"
 Released as git tags (`vMAJOR.MINOR.PATCH`); consumers pin a tag:
 
 ```toml
-wiretap-catalog = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.3.0" }
+wiretap-catalog = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.6.0" }
 ```
 
 Dev loop: pin the tag, but add a local `[patch]`/`path` override against a working
 checkout while iterating, so changes don't need a push/tag to test. Bump the
 version + tag a new `vX.Y.Z` to release.
 
-## Status & roadmap
+## Version history
 
-- **v0.4.0** — each decoded mux-case signal carries its `mux_value` (the
-  selector value of its mux), so consumers can track each mux case's signals
-  independently.
+- **v0.6.0** — serial header byte-positions are derived at parse time: `SerialConfig`
+  now carries `frame_id_*`, `source_address_*` and a `header_fields` list (each with
+  `start_byte`/`bytes`) resolved from the field masks, so consumers read them instead
+  of re-deriving.
+- **v0.5.0** — carry each signal's `format` through to the decoded output.
+- **v0.4.0** — each decoded mux-case signal carries its `mux_value` (the selector
+  value of its mux), so consumers can track each mux case's signals independently.
 - **v0.3.0** — `decode::decode_by_id` (apply `frame_id_mask`, look up the frame,
   decode signals/mux **and** extract header fields — CAN from the id, serial from
-  the header bytes — plus source-address resolution). This is what the live
-  stream calls per frame.
+  the header bytes — plus source-address resolution). This is what the live stream
+  calls per frame.
 - **v0.2.0** — grown from Modbus-only into the canonical catalogue library:
   unified `Catalog` model, `Catalog::parse` (CAN + Serial + Modbus), `validate`,
   `decode::decode_frame` (ported from WireTAP's `bits.ts`/`signalDecode.ts`/
   `muxCaseMatch.ts`, single-sourced with the Modbus decoder), and DBC
-  import/export. 80 tests, CI (fmt · clippy `-D warnings` · test).
+  import/export. CI (fmt · clippy `-D warnings` · test).
 - **v0.1.0** — Modbus catalogue parse / decode / encode + shorthands. Extracted
   from the Home Assistant ESS add-on.
-- **Next (in WireTAP):** the backend exposes the crate over the binary WebSocket
-  — a `catalog.*` command surface (parse/validate/serialise/DBC) for the editor,
-  and decode-on-attach streaming a new `DecodedSignals` message so the frontend
-  stops re-decoding every frame. Then the TS decode engine and the duplicate TS
-  catalogue parser are removed.
 
 ## Licence
 
