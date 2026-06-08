@@ -1,10 +1,11 @@
 [package]
 name = "wiretap-decode"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Protocol-agnostic decode primitives for WireTAP catalogues: bit extraction, word-swap, exact Decimal scaling, and value formatting."
+readme = "README.md"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
