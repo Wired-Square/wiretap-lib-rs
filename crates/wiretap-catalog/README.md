@@ -87,7 +87,7 @@ unit = "%"
 Released as git tags (`vMAJOR.MINOR.PATCH`); consumers pin a tag:
 
 ```toml
-wiretap-catalog = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.6.1" }
+wiretap-catalog = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.6.2" }
 ```
 
 Dev loop: pin the tag, but add a local `[patch]`/`path` override against a working
