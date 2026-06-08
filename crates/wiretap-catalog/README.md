@@ -96,6 +96,9 @@ version + tag a new `vX.Y.Z` to release.
 
 ## Version history
 
+- **v0.6.2** — repo restructured into a Cargo workspace; this crate moved to
+  `crates/wiretap-catalog/`. No API change — consumers resolve the member by
+  name and need no pin change beyond the tag.
 - **v0.6.1** — Modbus `DecodedSignal.value` is now an exact `Decimal`: scaling
   (`raw × factor + offset`) is done in `rust_decimal`, so a value like `3374 ×
   0.1` decodes to `337.4` rather than the f64 `337.40000000000003` that
