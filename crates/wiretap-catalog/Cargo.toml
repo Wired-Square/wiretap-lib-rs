@@ -1,0 +1,20 @@
+[package]
+name = "wiretap-catalog"
+version = "0.6.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Parser, validator, decoder, and writer for WireTAP-format device catalogues (TOML) across CAN, Serial, and Modbus."
+readme = "README.md"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+toml_edit = "0.22"
+thiserror = "2"
+can-dbc = "8"
+rust_decimal = { version = "1", features = ["serde"] }
+
+[dev-dependencies]
+serde_json = "1"
+rust_decimal_macros = "1"
