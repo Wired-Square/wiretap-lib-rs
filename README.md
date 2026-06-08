@@ -26,7 +26,10 @@ for s in &out.signals {
 ```
 
 The Modbus model is also available directly (`wiretap_catalog::modbus`) for the
-register-poll/encode workflow.
+register-poll/encode workflow. Its `decode_frame` returns `DecodedSignal`s whose
+`value` is an exact `Decimal` — scaling is done in `rust_decimal`, so
+`factor`/`offset` never introduce binary-float artefacts when a value is
+stringified for display or an entity state.
 
 ## Capabilities
 
@@ -84,7 +87,7 @@ unit = "%"
 Released as git tags (`vMAJOR.MINOR.PATCH`); consumers pin a tag:
 
 ```toml
-wiretap-catalog = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.6.0" }
+wiretap-catalog = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.6.1" }
 ```
 
 Dev loop: pin the tag, but add a local `[patch]`/`path` override against a working
@@ -93,6 +96,10 @@ version + tag a new `vX.Y.Z` to release.
 
 ## Version history
 
+- **v0.6.1** — Modbus `DecodedSignal.value` is now an exact `Decimal`: scaling
+  (`raw × factor + offset`) is done in `rust_decimal`, so a value like `3374 ×
+  0.1` decodes to `337.4` rather than the f64 `337.40000000000003` that
+  stringified with float noise for display/entity state.
 - **v0.6.0** — serial header byte-positions are derived at parse time: `SerialConfig`
   now carries `frame_id_*`, `source_address_*` and a `header_fields` list (each with
   `start_byte`/`bytes`) resolved from the field masks, so consumers read them instead
