@@ -53,8 +53,8 @@ use std::collections::BTreeMap;
 use rust_decimal::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::decode::{apply_word_swap, extract_bits};
 use crate::model::{Endianness, RegisterType, SignalFormat};
+use wiretap_decode::{apply_word_swap, extract_bits, scale};
 
 /// Poll interval used when neither the frame nor `[meta.modbus]` sets one.
 const DEFAULT_INTERVAL_MS: u64 = 5000;
@@ -581,13 +581,9 @@ pub fn decode_frame(frame: &ModbusFrame, regs: &[u16], meta: &ModbusMeta) -> Vec
         } else {
             extract_bits(&base, sig.start_bit, sig.bit_length, byte_order, sig.signed)
         };
-        // Scale in Decimal: f64 `3374 * 0.1` is 337.40000000000003, which
-        // stringifies with float noise. `from_f64` rounds the scale factor
-        // cleanly (0.1, 0.01, …); `raw` is integer-valued.
-        let dec = |x: f64| Decimal::from_f64(x).unwrap_or_default();
-        let factor = sig.factor.map(dec).unwrap_or(Decimal::ONE);
-        let offset = sig.offset.map(dec).unwrap_or(Decimal::ZERO);
-        let value = dec(raw) * factor + offset;
+        // Scale in exact Decimal (shared with the general decode path), so
+        // `3374 * 0.1` is `337.4`, not the float-noisy `337.40000000000003`.
+        let value = scale(raw, sig.factor, sig.offset);
         out.push(DecodedSignal {
             name: sig.name.clone(),
             value,

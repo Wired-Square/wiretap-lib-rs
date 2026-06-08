@@ -6,12 +6,18 @@
 //! the generated TypeScript reads idiomatically) and is the input to
 //! [`crate::decode`].
 //!
-//! The shared enums ([`Endianness`], [`SignalFormat`], [`RegisterType`]) live
-//! here; the `modbus` module re-exports them so its public API is unchanged.
+//! The catalogue enums ([`SignalFormat`], [`RegisterType`]) live here; the
+//! `modbus` module re-exports them so its public API is unchanged. [`Endianness`]
+//! is the protocol-agnostic byte/word ordering — it lives in `wiretap-decode`
+//! (the numeric core) and is re-exported here so callers keep using
+//! `model::Endianness`.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+
+/// Byte / word ordering — re-exported from the `wiretap-decode` numeric core.
+pub use wiretap_decode::Endianness;
 
 /// Which wire protocol a frame/catalogue uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,15 +26,6 @@ pub enum Protocol {
     Can,
     Serial,
     Modbus,
-}
-
-/// Byte / word ordering. `Big` is the standard convention (high-order first);
-/// `Little` is byte/word-swapped (e.g. Sungrow's word-swapped "CDAB").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Endianness {
-    Big,
-    Little,
 }
 
 /// Modbus register class — determines the function code the poller uses.

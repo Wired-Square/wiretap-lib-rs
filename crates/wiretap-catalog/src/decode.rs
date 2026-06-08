@@ -7,6 +7,10 @@
 //! [`extract_bits`]/[`apply_word_swap`] from here.
 
 use crate::model::{Catalog, Endianness, Frame, Mux, Protocol, Signal, SignalFormat};
+use rust_decimal::prelude::ToPrimitive;
+use wiretap_decode::{
+    apply_word_swap, decode_text, extract_bits, format_decimal, format_hex, format_unix_time, scale,
+};
 
 /// A decoded signal value. Mirrors the TS `DecodedValue`.
 #[derive(Debug, Clone, PartialEq)]
@@ -62,90 +66,6 @@ pub struct FrameDecode {
     pub source_address: Option<u64>,
 }
 
-// ---------- bit extraction (shared with modbus) ----------
-
-/// Extract a bitfield as an `f64`, honouring endianness and sign. Faithful
-/// port of `extractBits` (i128 accumulator covers up to 64-bit signals without
-/// precision loss; the TS BigInt path is the same algorithm).
-pub fn extract_bits(
-    bytes: &[u8],
-    start_bit: u32,
-    bit_length: u32,
-    endian: Endianness,
-    signed: bool,
-) -> f64 {
-    if bit_length == 0 {
-        return 0.0;
-    }
-    let mut bits: Vec<u8> = Vec::with_capacity(bytes.len() * 8);
-    match endian {
-        Endianness::Big => {
-            for &b in bytes {
-                for k in (0..8).rev() {
-                    bits.push((b >> k) & 1);
-                }
-            }
-        }
-        Endianness::Little => {
-            for &b in bytes {
-                for k in 0..8 {
-                    bits.push((b >> k) & 1);
-                }
-            }
-        }
-    }
-    let start = (start_bit as usize).min(bits.len());
-    let end = (start + bit_length as usize).min(bits.len());
-    let slice = &bits[start..end];
-
-    let mut value: i128 = 0;
-    match endian {
-        Endianness::Big => {
-            for &bit in slice {
-                value = (value << 1) | bit as i128;
-            }
-        }
-        Endianness::Little => {
-            for &bit in slice.iter().rev() {
-                value = (value << 1) | bit as i128;
-            }
-        }
-    }
-    if signed {
-        let sign_bit: i128 = 1 << (bit_length - 1);
-        if value & sign_bit != 0 {
-            value -= 1 << bit_length;
-        }
-    }
-    value as f64
-}
-
-/// Swap 16-bit words within a signal's byte span (low-word-first →
-/// high-word-first) before big-endian extraction — the Sungrow "CDAB" case.
-/// Mirrors the word-swap in `decodeSignal` / modbus `apply_word_swap`.
-pub fn apply_word_swap(bytes: &mut [u8], start_bit: u32, bit_length: u32) {
-    let start_byte = (start_bit / 8) as usize;
-    let num_bytes = bit_length.div_ceil(8) as usize;
-    let num_words = num_bytes.div_ceil(2);
-    let mut words: Vec<(u8, u8)> = Vec::with_capacity(num_words);
-    for i in 0..num_words {
-        let idx = start_byte + i * 2;
-        let a = bytes.get(idx).copied().unwrap_or(0);
-        let b = bytes.get(idx + 1).copied().unwrap_or(0);
-        words.push((a, b));
-    }
-    words.reverse();
-    for (i, (a, b)) in words.into_iter().enumerate() {
-        let idx = start_byte + i * 2;
-        if idx < bytes.len() {
-            bytes[idx] = a;
-        }
-        if idx + 1 < bytes.len() {
-            bytes[idx + 1] = b;
-        }
-    }
-}
-
 // ---------- single-signal decode (port of signalDecode.ts) ----------
 
 /// Decode one signal from `bytes`. `default_endianness` applies when the signal
@@ -182,9 +102,11 @@ pub fn decode_signal(
         extract_bits(bytes, start, len, endianness, sig.signed.unwrap_or(false))
     };
 
-    let factor = sig.factor.unwrap_or(1.0);
-    let offset = sig.offset.unwrap_or(0.0);
-    let scaled = raw * factor + offset;
+    // Scale in exact Decimal (raw is integer-valued; from_f64 rounds the factor
+    // cleanly) so the display string carries no binary-float artifacts. `scaled`
+    // (f64) is kept for the numeric consumers (charts).
+    let scaled_dec = scale(raw, sig.factor, sig.offset);
+    let scaled = scaled_dec.to_f64().unwrap_or(f64::NAN);
     let unit = sig.unit.clone();
 
     // Per-format display + the scaled/unit that actually apply (enum/text don't
@@ -212,7 +134,7 @@ pub fn decode_signal(
             (display, raw, None)
         }
         Some(SignalFormat::UnixTime) => (format_unix_time(scaled), scaled, None),
-        Some(SignalFormat::Other) | None => (format_number(scaled), scaled, unit),
+        Some(SignalFormat::Other) | None => (format_decimal(scaled_dec), scaled, unit),
     };
 
     Decoded {
@@ -224,104 +146,6 @@ pub fn decode_signal(
         mux_value: None,
         format: sig.format,
     }
-}
-
-/// Format a raw value as byte-separated hex (`"1A 2B 3C"`), MSB-first for big
-/// endian. Port of `formatHex`.
-fn format_hex(value: f64, bit_length: u32, endian: Endianness) -> String {
-    let num_bytes = bit_length.div_ceil(8).max(1) as usize;
-    let mask: u128 = if bit_length >= 128 {
-        u128::MAX
-    } else {
-        (1u128 << bit_length) - 1
-    };
-    let mut v = (value as i128 as u128) & mask;
-    let mut bytes = Vec::with_capacity(num_bytes);
-    for _ in 0..num_bytes {
-        bytes.push((v & 0xff) as u8);
-        v >>= 8;
-    }
-    if endian == Endianness::Big {
-        bytes.reverse();
-    }
-    bytes
-        .iter()
-        .map(|b| format!("{b:02X}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Extract the bytes a text signal spans and decode to a string, dropping NULs.
-/// Port of `extractTextBytes` + `bytesToText`.
-fn decode_text(bytes: &[u8], start_bit: u32, bit_length: u32) -> String {
-    let start_byte = (start_bit / 8) as usize;
-    let num_bytes = bit_length.div_ceil(8) as usize;
-    let mut out = String::new();
-    for i in 0..num_bytes {
-        let b = bytes.get(start_byte + i).copied().unwrap_or(0);
-        if b != 0 {
-            out.push(b as char);
-        }
-    }
-    out
-}
-
-/// Format a unix timestamp as `YYYY-MM-DD HH:MM:SS` (UTC). The TS version uses
-/// the browser's local timezone; we use UTC for determinism (the frontend may
-/// re-localise). Seconds vs milliseconds is auto-detected as in the TS.
-fn format_unix_time(value: f64) -> String {
-    if !value.is_finite() {
-        return format!("Invalid ({value})");
-    }
-    // > year ~3000 in seconds ⇒ treat as milliseconds.
-    let secs = if value > 32_503_680_000.0 {
-        (value / 1000.0) as i64
-    } else {
-        value as i64
-    };
-    let (y, mo, d, h, mi, s) = civil_from_unix(secs);
-    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
-}
-
-/// Convert a unix timestamp (seconds, UTC) to a civil date-time. Uses Howard
-/// Hinnant's days→civil algorithm (proleptic Gregorian).
-fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let year = if m <= 2 { y + 1 } else { y };
-    (year, m, d, h as u32, mi as u32, s as u32)
-}
-
-/// Format a scaled number cleanly, trimming float artefacts (so `555 * 0.1`
-/// renders `55.5`, not `55.50000000000001`). Approximates the TS `Decimal`
-/// display.
-fn format_number(value: f64) -> String {
-    if !value.is_finite() {
-        return value.to_string();
-    }
-    if value == value.trunc() && value.abs() < 1e15 {
-        return format!("{}", value as i64);
-    }
-    // Round to 12 significant-ish decimals, then trim trailing zeros.
-    let mut s = format!("{value:.12}");
-    while s.contains('.') && s.ends_with('0') {
-        s.pop();
-    }
-    if s.ends_with('.') {
-        s.pop();
-    }
-    s
 }
 
 // ---------- mux matching (port of muxCaseMatch.ts) ----------
