@@ -50,6 +50,7 @@
 
 use std::collections::BTreeMap;
 
+use rust_decimal::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::decode::{apply_word_swap, extract_bits};
@@ -580,7 +581,12 @@ pub fn decode_frame(frame: &ModbusFrame, regs: &[u16], meta: &ModbusMeta) -> Vec
         } else {
             extract_bits(&base, sig.start_bit, sig.bit_length, byte_order, sig.signed)
         };
-        let value = raw * sig.factor.unwrap_or(1.0) + sig.offset.unwrap_or(0.0);
+        // Scale in Decimal: f64 `3374 * 0.1` is 337.40000000000003, which
+        // stringifies with float noise. `from_f64` rounds the scale factor
+        // cleanly (0.1, 0.01, …); `raw` is integer-valued.
+        let factor = sig.factor.and_then(Decimal::from_f64).unwrap_or(Decimal::ONE);
+        let offset = sig.offset.and_then(Decimal::from_f64).unwrap_or(Decimal::ZERO);
+        let value = Decimal::from_f64(raw).unwrap_or_default() * factor + offset;
         out.push(DecodedSignal {
             name: sig.name.clone(),
             value,
@@ -594,7 +600,10 @@ pub fn decode_frame(frame: &ModbusFrame, regs: &[u16], meta: &ModbusMeta) -> Vec
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedSignal {
     pub name: String,
-    pub value: f64,
+    /// Scaled value as an exact `Decimal` so `raw × factor + offset` doesn't
+    /// pick up binary-float artifacts (e.g. `3374 × 0.1` is `337.4`, not
+    /// `337.40000000000003`) when stringified for display or an entity state.
+    pub value: Decimal,
     pub unit: Option<String>,
 }
 
@@ -728,6 +737,7 @@ fn synth_frame_signal(key: &str, length: u16, f: &RawFrame) -> Option<ModbusSign
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
 
     const SUNGROW: &str = include_str!("testdata/sungrow_shx.toml");
 
@@ -779,7 +789,7 @@ mod tests {
         regs[3] = 555; // ×0.1 → 55.5 %
         let decoded = decode_frame(bs, &regs, &m.meta);
         let soc = decoded.iter().find(|d| d.name == "Battery_SoC").unwrap();
-        assert!((soc.value - 55.5).abs() < 1e-9, "soc = {}", soc.value);
+        assert_eq!(soc.value, dec!(55.5));
         assert_eq!(soc.unit.as_deref(), Some("%"));
         // The ascii-free battery_status still skips nothing numeric; the
         // signed temperature decodes too.
@@ -796,7 +806,7 @@ mod tests {
         let decoded = decode_frame(bp, &regs, &m.meta);
         let p = &decoded[0];
         assert_eq!(p.name, "Battery_Power");
-        assert!((p.value - -1000.0).abs() < 1e-9, "power = {}", p.value);
+        assert_eq!(p.value, dec!(-1000));
     }
 
     #[test]
@@ -806,7 +816,7 @@ mod tests {
         // +2000 W: 0x000007D0 → registers [low=0x07D0, high=0x0000].
         let regs = [0x07D0u16, 0x0000u16];
         let p = &decode_frame(bp, &regs, &m.meta)[0];
-        assert!((p.value - 2000.0).abs() < 1e-9, "power = {}", p.value);
+        assert_eq!(p.value, dec!(2000));
     }
 
     #[test]
@@ -821,9 +831,9 @@ mod tests {
         regs[7] = 0x0000;
         let decoded = decode_frame(pv, &regs, &m.meta);
         let dc = decoded.iter().find(|d| d.name == "Total_DC_Power").unwrap();
-        assert!((dc.value - 5000.0).abs() < 1e-9, "dc = {}", dc.value);
+        assert_eq!(dc.value, dec!(5000));
         let v = decoded.iter().find(|d| d.name == "MPPT1_Voltage").unwrap();
-        assert!((v.value - 250.0).abs() < 1e-9);
+        assert_eq!(v.value, dec!(250));
     }
 
     #[test]
@@ -858,7 +868,7 @@ bit_length = 16
         // regs = [0x00AB, 0xCD00] → bytes 00 AB CD 00 → bits[8..24] = AB CD.
         let regs = [0x00ABu16, 0xCD00u16];
         let d = &decode_frame(f, &regs, &m.meta)[0];
-        assert_eq!(d.value as u32, 0xABCD);
+        assert_eq!(d.value.to_u32().unwrap(), 0xABCD);
     }
 
     #[test]
@@ -987,8 +997,27 @@ unit = "°C"
         assert_eq!(s.bit_length, 16);
         // 0x0199 = 409 ×0.1 = 40.9.
         let d = &decode_frame(f, &[0x0199], &m.meta)[0];
-        assert!((d.value - 40.9).abs() < 1e-9, "value = {}", d.value);
+        assert_eq!(d.value, dec!(40.9));
         assert_eq!(d.unit.as_deref(), Some("°C"));
+    }
+
+    #[test]
+    fn scaled_value_stringifies_without_float_artifacts() {
+        // Regression: f64 `3374 * 0.1` is 337.40000000000003, which
+        // stringifies with binary-float noise. Decimal scaling is exact, so
+        // the entity state the addon stores reads cleanly.
+        let toml = r#"
+[frame.modbus.0x138F]
+register_type = "input"
+length = 1
+name = "MPPT_Voltage"
+factor = 0.1
+unit = "V"
+"#;
+        let m = ModbusManifest::parse(toml).unwrap();
+        let d = &decode_frame(&m.frames[0], &[3374], &m.meta)[0];
+        assert_eq!(d.value, dec!(337.4));
+        assert_eq!(d.value.to_string(), "337.4");
     }
 
     #[test]
@@ -1039,7 +1068,7 @@ unit = "W"
         assert!(f.signals[0].signed);
         // 0xFF69 as signed 16-bit = -151.
         let d = &decode_frame(f, &[0xFF69], &m.meta)[0];
-        assert_eq!(d.value, -151.0);
+        assert_eq!(d.value, dec!(-151));
     }
 
     #[test]
@@ -1199,7 +1228,7 @@ unit = "W"
             .iter()
             .find(|d| d.name == "Forced_Charge_Discharge_Cmd")
             .expect("enum signal decodes");
-        assert_eq!(cmd.value, 204.0);
+        assert_eq!(cmd.value, dec!(204));
     }
 
     fn reg(address: u16, value: u16) -> ModbusWrite {
@@ -1252,7 +1281,7 @@ unit = "W"
         // Round-trip the written register block through the decoder.
         let regs: Vec<u16> = writes.iter().map(|w| w.value).collect();
         let decoded = decode_frame(f, &regs, &m.meta);
-        assert_eq!(decoded[0].value, -1000.0);
+        assert_eq!(decoded[0].value, dec!(-1000));
     }
 
     #[test]

@@ -1,2 +1,6 @@
 /target
 Cargo.lock
+
+# Local Claude Code config — never commit
+CLAUDE.md
+/.claude/
