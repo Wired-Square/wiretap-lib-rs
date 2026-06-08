@@ -584,9 +584,10 @@ pub fn decode_frame(frame: &ModbusFrame, regs: &[u16], meta: &ModbusMeta) -> Vec
         // Scale in Decimal: f64 `3374 * 0.1` is 337.40000000000003, which
         // stringifies with float noise. `from_f64` rounds the scale factor
         // cleanly (0.1, 0.01, …); `raw` is integer-valued.
-        let factor = sig.factor.and_then(Decimal::from_f64).unwrap_or(Decimal::ONE);
-        let offset = sig.offset.and_then(Decimal::from_f64).unwrap_or(Decimal::ZERO);
-        let value = Decimal::from_f64(raw).unwrap_or_default() * factor + offset;
+        let dec = |x: f64| Decimal::from_f64(x).unwrap_or_default();
+        let factor = sig.factor.map(dec).unwrap_or(Decimal::ONE);
+        let offset = sig.offset.map(dec).unwrap_or(Decimal::ZERO);
+        let value = dec(raw) * factor + offset;
         out.push(DecodedSignal {
             name: sig.name.clone(),
             value,
