@@ -93,7 +93,7 @@ pub enum Confidence {
 /// A single decoded field, resolved from the catalogue. Fields are optional
 /// because mux-case and inherited signals may carry only overrides; a fully
 /// resolved signal for decode has `name`/`start_bit`/`bit_length` set.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Signal {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -132,6 +132,14 @@ pub struct Signal {
     /// than defined directly on the frame.
     #[serde(default, skip_serializing_if = "is_false")]
     pub inherited: bool,
+    /// Modbus-specific: the signal's own register number, synthesised from the
+    /// frame's base register plus the signal's bit offset (word registers add
+    /// `start_bit / 16`; coils/discretes add `start_bit`). `None` for non-Modbus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modbus_register: Option<u32>,
+    /// Modbus-specific: how many registers (or coils) this signal spans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modbus_register_count: Option<u16>,
 }
 
 fn is_false(b: &bool) -> bool {

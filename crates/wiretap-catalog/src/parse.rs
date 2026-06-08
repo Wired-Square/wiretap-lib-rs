@@ -134,6 +134,7 @@ fn normalise_signal(raw: &Value, inherited: bool) -> Signal {
         enum_map: parse_enum_map(get(raw, "enum")),
         confidence: as_str(raw, "confidence").and_then(parse_confidence),
         inherited: inherited || as_bool(raw, "_inherited").unwrap_or(false),
+        ..Default::default()
     }
 }
 
@@ -502,12 +503,26 @@ fn parse_modbus_config(root: &Value) -> Option<ModbusConfig> {
 
 // ---------- modbus frame mapping (reuse ModbusManifest) ----------
 
-fn map_modbus_signal(s: &crate::modbus::ModbusSignal) -> Signal {
+fn map_modbus_signal(
+    s: &crate::modbus::ModbusSignal,
+    base_register: u32,
+    register_type: RegisterType,
+) -> Signal {
     let enum_map = s.enum_map.as_ref().map(|m| {
         m.iter()
             .filter_map(|(k, v)| k.parse::<i64>().ok().map(|n| (n, v.clone())))
             .collect::<BTreeMap<i64, String>>()
     });
+    // Synthesise the signal's own register address + span from its bit offset.
+    // Word registers (holding/input) hold 16 bits each; coils/discretes are
+    // 1 bit each, so the bit offset maps straight to a coil offset.
+    let bits_per_register = if register_type.is_register_bank() {
+        16
+    } else {
+        1
+    };
+    let modbus_register = base_register + s.start_bit / bits_per_register;
+    let modbus_register_count = s.bit_length.div_ceil(bits_per_register) as u16;
     Signal {
         name: Some(s.name.clone()),
         start_bit: Some(s.start_bit),
@@ -518,12 +533,11 @@ fn map_modbus_signal(s: &crate::modbus::ModbusSignal) -> Signal {
         factor: s.factor,
         offset: s.offset,
         unit: s.unit.clone(),
-        min: None,
-        max: None,
         format: s.format,
         enum_map: enum_map.filter(|m| !m.is_empty()),
-        confidence: None,
-        inherited: false,
+        modbus_register: Some(modbus_register),
+        modbus_register_count: Some(modbus_register_count),
+        ..Default::default()
     }
 }
 
@@ -557,7 +571,11 @@ fn modbus_frames(text: &str) -> Vec<Frame> {
                 bus: None,
                 is_extended: None,
                 is_fd: None,
-                signals: f.signals.iter().map(map_modbus_signal).collect(),
+                signals: f
+                    .signals
+                    .iter()
+                    .map(|s| map_modbus_signal(s, f.register_number as u32, f.register_type))
+                    .collect(),
                 mux: None,
                 mirror_of: None,
                 copy_from: None,
@@ -988,6 +1006,42 @@ unit = "C"
         let s = sig(f, "Inverter_Temperature");
         assert_eq!(s.factor, Some(0.1));
         assert_eq!(s.bit_length, Some(16));
+        // Single-register signal sits on the frame's base register.
+        assert_eq!(s.modbus_register, Some(0x138F));
+        assert_eq!(s.modbus_register_count, Some(1));
+    }
+
+    #[test]
+    fn synthesises_per_signal_modbus_registers() {
+        // A multi-register block: signals carry their own register + span,
+        // derived from the frame's base register and each signal's bit offset.
+        let toml = r#"
+[meta]
+name = "mb"
+[meta.modbus]
+register_base = 0
+
+[frame.modbus.13019]
+register_type = "input"
+length = 9
+name = "Battery_Block"
+[[frame.modbus.13019.signals]]
+name = "Battery_Voltage"
+start_bit = 0
+bit_length = 16
+[[frame.modbus.13019.signals]]
+name = "Battery_Energy"
+start_bit = 32
+bit_length = 32
+"#;
+        let c = Catalog::parse(toml).unwrap();
+        let f = c.frame(13019).unwrap();
+        let v = sig(f, "Battery_Voltage");
+        assert_eq!(v.modbus_register, Some(13019)); // base + 0/16
+        assert_eq!(v.modbus_register_count, Some(1)); // 16 bits → 1 register
+        let e = sig(f, "Battery_Energy");
+        assert_eq!(e.modbus_register, Some(13021)); // base + 32/16
+        assert_eq!(e.modbus_register_count, Some(2)); // 32 bits → 2 registers
     }
 
     #[test]
