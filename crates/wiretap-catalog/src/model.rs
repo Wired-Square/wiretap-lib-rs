@@ -167,7 +167,30 @@ pub struct Mux {
     pub name: Option<String>,
     pub start_bit: u32,
     pub bit_length: u32,
+    /// The default case key applied when the selector matches no explicit case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
     pub cases: BTreeMap<String, MuxCase>,
+}
+
+/// A per-frame checksum definition (`[[frame.<proto>.<key>.checksum]]`).
+/// Distinct from [`ChecksumConfig`] (the serial-level default); a frame may
+/// declare several.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameChecksum {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub algorithm: String,
+    pub start_byte: u32,
+    #[serde(default = "one")]
+    pub byte_length: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endianness: Option<Endianness>,
+    #[serde(default)]
+    pub calc_start_byte: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calc_end_byte: Option<u32>,
 }
 
 /// A resolved frame: one CAN message / serial frame / Modbus register read,
@@ -175,6 +198,11 @@ pub struct Mux {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Frame {
+    /// The authored catalogue table key (CAN: `"0x103"`; serial/modbus: the
+    /// frame name). The stable identifier the editor uses for tree paths and
+    /// comment-preserving edits — preserved verbatim, unlike the numeric
+    /// `frame_id`.
+    pub key: String,
     /// Numeric identifier: CAN arbitration ID, serial frame id, or Modbus
     /// register number.
     pub frame_id: u32,
@@ -209,6 +237,23 @@ pub struct Frame {
     /// Modbus-specific: register count (not bytes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modbus_register_count: Option<u16>,
+    /// Serial-specific: explicit frame delimiter bytes (raw encoding).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<Vec<u8>>,
+    /// Free-text notes, normalised from the catalogue's `notes` (a string or an
+    /// array of strings).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+    /// Per-frame checksum definitions (CAN/serial; absent on Modbus).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checksums: Vec<FrameChecksum>,
+    /// Names of fields whose value was inherited (from a per-frame default,
+    /// a `copy`/`mirror_of` source, or auto-detection) rather than set
+    /// explicitly on this frame. Drives the editor's "(inherited)" labels.
+    /// Possible entries: `length`, `transmitter`, `interval`, `extended`,
+    /// `fd`, `deviceAddress`, `registerBase`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inherited_fields: Vec<String>,
 }
 
 /// A header field defined by a bitmask over the frame's header bytes (CAN ID
@@ -346,6 +391,15 @@ pub struct Meta {
     pub default_frame: Option<Protocol>,
 }
 
+/// A network node/peer declared under `[node.<name>]`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeDef {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
 /// A fully parsed, resolved catalogue.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -362,6 +416,9 @@ pub struct Catalog {
     pub modbus: Option<ModbusConfig>,
     #[serde(default)]
     pub frames: Vec<Frame>,
+    /// Network nodes/peers from the `[node]` table, in key order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<NodeDef>,
 }
 
 /// A single validation finding (field path + human message).

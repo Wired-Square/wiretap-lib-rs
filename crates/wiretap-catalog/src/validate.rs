@@ -6,10 +6,12 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::Deserialize;
 use toml::Value;
 
 use crate::modbus::{ManifestError, ModbusManifest};
 use crate::model::ValidationError;
+use crate::parse::parse_id;
 
 fn err(field: impl Into<String>, message: impl Into<String>) -> ValidationError {
     ValidationError {
@@ -65,7 +67,46 @@ pub fn validate(content: &str) -> Vec<ValidationError> {
         }
     }
 
+    validate_serial_encoding(table, &mut errors);
+
     errors
+}
+
+/// Serial frames require an encoding (declared in `[meta.serial]` or the legacy
+/// `[frame.serial.config]`). Ports the editor's `validateSerialConfig`.
+fn validate_serial_encoding(
+    table: &toml::map::Map<String, Value>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let serial = table
+        .get("frame")
+        .and_then(Value::as_table)
+        .and_then(|f| f.get("serial"))
+        .and_then(Value::as_table);
+    let has_serial_frames = serial
+        .map(|s| s.keys().any(|k| k != "config"))
+        .unwrap_or(false);
+    if !has_serial_frames {
+        return;
+    }
+    let encoding_in = |t: Option<&toml::map::Map<String, Value>>| {
+        t.and_then(|s| s.get("encoding"))
+            .and_then(Value::as_str)
+            .map(|e| !e.is_empty())
+            .unwrap_or(false)
+    };
+    let meta_serial = table
+        .get("meta")
+        .and_then(Value::as_table)
+        .and_then(|m| m.get("serial"))
+        .and_then(Value::as_table);
+    let frame_serial_config = serial.and_then(|s| s.get("config")).and_then(Value::as_table);
+    if !encoding_in(meta_serial) && !encoding_in(frame_serial_config) {
+        errors.push(err(
+            "frame.serial.config.encoding",
+            "Encoding is required when serial frames exist. Add [frame.serial.config] with encoding = \"slip\", \"cobs\", \"raw\", or \"length_prefixed\".",
+        ));
+    }
 }
 
 fn validate_meta(table: &toml::map::Map<String, Value>, errors: &mut Vec<ValidationError>) {
@@ -298,6 +339,422 @@ fn validate_mux_object(prefix: &str, mux: &Value, errors: &mut Vec<ValidationErr
     }
 }
 
+// ===========================================================================
+// Granular field validators — the single source of truth for the editor's
+// per-form, save-time validation (ported verbatim from the former TS
+// `validate.ts` + `protocols/*.ts`). Exposed over WS as `catalog.validate*`.
+// ===========================================================================
+
+/// Canonical checksum algorithm ids (ported from the editor's checksum list).
+const CHECKSUM_ALGORITHMS: &[&str] = &[
+    "xor",
+    "sum8",
+    "crc8",
+    "crc8_sae_j1850",
+    "crc8_autosar",
+    "crc8_maxim",
+    "crc8_cdma2000",
+    "crc8_dvb_s2",
+    "crc8_nissan",
+    "crc16_modbus",
+    "crc16_ccitt",
+];
+
+fn is_hex_id(s: &str) -> bool {
+    s.strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .map(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()))
+        .unwrap_or(false)
+}
+
+fn is_dec_id(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+}
+
+fn is_identifier(s: &str) -> bool {
+    let mut cs = s.chars();
+    match cs.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Resolve a possibly-negative byte index against a frame length (mirrors the
+/// editor's `resolveByteIndexSync`: `-1` → last byte).
+fn resolve_byte_index(index: i64, frame_length: i64) -> i64 {
+    if index >= 0 {
+        index
+    } else {
+        (frame_length + index).max(0)
+    }
+}
+
+// ---- meta ----
+
+#[derive(Debug, Default, Deserialize)]
+pub struct MetaInput {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub version: i64,
+}
+
+pub fn validate_meta_fields(m: &MetaInput) -> Vec<ValidationError> {
+    let mut e = Vec::new();
+    if m.name.trim().is_empty() {
+        e.push(err("meta.name", "Name is required"));
+    }
+    if m.version < 1 {
+        e.push(err("meta.version", "Version must be at least 1"));
+    }
+    e
+}
+
+// ---- signal ----
+
+#[derive(Debug, Default, Deserialize)]
+pub struct SignalInput {
+    #[serde(default)]
+    pub name: String,
+    pub start_bit: Option<i64>,
+    pub bit_length: Option<i64>,
+    pub endianness: Option<String>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub format: Option<String>,
+    #[serde(rename = "enum")]
+    pub enum_map: Option<serde_json::Value>,
+}
+
+pub fn validate_signal_fields(s: &SignalInput) -> Vec<ValidationError> {
+    let mut e = Vec::new();
+    if s.name.trim().is_empty() {
+        e.push(err("signal.name", "Name is required"));
+    }
+    match s.start_bit {
+        Some(b) if b >= 0 => {}
+        _ => e.push(err(
+            "signal.start_bit",
+            "Start bit must be a non-negative integer",
+        )),
+    }
+    let is_string_format = matches!(s.format.as_deref(), Some("utf8" | "ascii" | "hex"));
+    let max_bits = if is_string_format { 2048 } else { 64 };
+    match s.bit_length {
+        Some(b) if b >= 1 && b <= max_bits => {}
+        _ => e.push(err(
+            "signal.bit_length",
+            if is_string_format {
+                "Bit length must be an integer between 1 and 2048 for string formats".to_string()
+            } else {
+                "Bit length must be an integer between 1 and 64".to_string()
+            },
+        )),
+    }
+    if let Some(end) = s.endianness.as_deref() {
+        if end != "little" && end != "big" {
+            e.push(err("signal.endianness", "Endianness must be \"little\" or \"big\""));
+        }
+    }
+    if let (Some(min), Some(max)) = (s.min, s.max) {
+        if min > max {
+            e.push(err("signal.range", "Min cannot be greater than max"));
+        }
+    }
+    if let Some(v) = &s.enum_map {
+        if !v.is_object() {
+            e.push(err(
+                "signal.enum",
+                "Enum must be a map of string keys to string values",
+            ));
+        }
+    }
+    e
+}
+
+// ---- checksum ----
+
+fn default_frame_length() -> i64 {
+    256
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChecksumInput {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub algorithm: String,
+    pub start_byte: Option<i64>,
+    pub byte_length: Option<i64>,
+    pub endianness: Option<String>,
+    pub calc_start_byte: Option<i64>,
+    pub calc_end_byte: Option<i64>,
+    #[serde(default = "default_frame_length")]
+    pub frame_length: i64,
+}
+
+pub fn validate_checksum_fields(c: &ChecksumInput) -> Vec<ValidationError> {
+    let mut e = Vec::new();
+    let frame_length = c.frame_length;
+
+    if c.name.trim().is_empty() {
+        e.push(err("checksum.name", "Name is required"));
+    }
+    if !CHECKSUM_ALGORITHMS.contains(&c.algorithm.as_str()) {
+        e.push(err(
+            "checksum.algorithm",
+            format!("Algorithm must be one of: {}", CHECKSUM_ALGORITHMS.join(", ")),
+        ));
+    }
+
+    // start_byte (supports negative indexing).
+    match c.start_byte {
+        None => e.push(err("checksum.start_byte", "Start byte must be an integer")),
+        Some(sb) => {
+            let resolved = resolve_byte_index(sb, frame_length);
+            if resolved < 0 || resolved >= frame_length {
+                e.push(err(
+                    "checksum.start_byte",
+                    if sb < 0 {
+                        format!("Start byte {sb} resolves to {resolved}, which is out of range [0, {}]", frame_length - 1)
+                    } else {
+                        format!("Start byte must be less than frame length ({frame_length})")
+                    },
+                ));
+            }
+        }
+    }
+
+    // byte_length.
+    let byte_length = c.byte_length.unwrap_or(0);
+    if !(1..=4).contains(&byte_length) {
+        e.push(err(
+            "checksum.byte_length",
+            "Byte length must be an integer between 1 and 4",
+        ));
+    }
+
+    // Fits in frame (resolved start + length).
+    if let Some(sb) = c.start_byte {
+        let resolved = resolve_byte_index(sb, frame_length);
+        if resolved >= 0 && resolved + byte_length > frame_length {
+            e.push(err(
+                "checksum.start_byte",
+                format!("Checksum position (byte {resolved} + {byte_length}) exceeds frame length ({frame_length})"),
+            ));
+        }
+    }
+
+    if let Some(end) = c.endianness.as_deref() {
+        if end != "little" && end != "big" {
+            e.push(err("checksum.endianness", "Endianness must be \"little\" or \"big\""));
+        }
+    }
+
+    // calc range (supports negative indexing).
+    match c.calc_start_byte {
+        None => e.push(err(
+            "checksum.calc_start_byte",
+            "Calculation start byte must be an integer",
+        )),
+        Some(cs) => {
+            let resolved = resolve_byte_index(cs, frame_length);
+            if resolved < 0 || resolved >= frame_length {
+                e.push(err(
+                    "checksum.calc_start_byte",
+                    if cs < 0 {
+                        format!("Calculation start byte {cs} resolves to {resolved}, which is out of range")
+                    } else {
+                        "Calculation start byte must be within frame bounds".to_string()
+                    },
+                ));
+            }
+        }
+    }
+    match c.calc_end_byte {
+        None => e.push(err(
+            "checksum.calc_end_byte",
+            "Calculation end byte must be an integer",
+        )),
+        Some(ce) => {
+            let resolved = resolve_byte_index(ce, frame_length);
+            if resolved < 1 || resolved > frame_length {
+                e.push(err(
+                    "checksum.calc_end_byte",
+                    if ce < 0 {
+                        format!("Calculation end byte {ce} resolves to {resolved}, which is out of range")
+                    } else {
+                        format!("Calculation end byte ({ce}) exceeds frame length ({frame_length})")
+                    },
+                ));
+            }
+        }
+    }
+    if let (Some(cs), Some(ce)) = (c.calc_start_byte, c.calc_end_byte) {
+        let rs = resolve_byte_index(cs, frame_length);
+        let re = resolve_byte_index(ce, frame_length);
+        if rs >= re {
+            e.push(err(
+                "checksum.calc_range",
+                format!("Calculation range is invalid: start ({rs}) must be less than end ({re})"),
+            ));
+        }
+    }
+    e
+}
+
+// ---- frame (common + protocol config) ----
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameInput {
+    #[serde(default)]
+    pub protocol: String,
+    /// Identity: CAN id, serial frame_id, or the Modbus table key.
+    #[serde(default)]
+    pub key: String,
+    pub length: Option<i64>,
+    pub transmitter: Option<String>,
+    pub interval: Option<i64>,
+    pub max_length: Option<i64>,
+    // CAN
+    pub extended: Option<bool>,
+    // Modbus
+    pub register_number: Option<i64>,
+    pub device_address: Option<i64>,
+    pub register_type: Option<String>,
+    pub register_base: Option<i64>,
+    // Serial
+    pub delimiter: Option<Vec<i64>>,
+    // Context
+    #[serde(default)]
+    pub existing_keys: Vec<String>,
+    pub original_key: Option<String>,
+    #[serde(default)]
+    pub available_peers: Vec<String>,
+}
+
+pub fn validate_frame_fields(f: &FrameInput) -> Vec<ValidationError> {
+    let mut e = Vec::new();
+
+    // Common fields.
+    let max_len = f.max_length.unwrap_or(64);
+    if let Some(len) = f.length {
+        if len < 0 || len > max_len {
+            e.push(err("length", format!("Length must be between 0 and {max_len}")));
+        }
+    }
+    if let Some(iv) = f.interval {
+        if iv < 0 {
+            e.push(err("interval", "Interval must be >= 0"));
+        }
+    }
+    if let Some(tx) = f.transmitter.as_deref().filter(|t| !t.is_empty()) {
+        if !f.available_peers.is_empty() && !f.available_peers.iter().any(|p| p == tx) {
+            e.push(err(
+                "transmitter",
+                format!(
+                    "Transmitter must be one of the known peers ({})",
+                    f.available_peers.join(", ")
+                ),
+            ));
+        }
+    }
+
+    let is_unique = |id: &str| {
+        let original = f.original_key.as_deref();
+        original != Some(id) && f.existing_keys.iter().any(|k| k == id)
+    };
+
+    match f.protocol.as_str() {
+        "can" => {
+            let id = f.key.trim();
+            if id.is_empty() {
+                e.push(err("id", "ID is required"));
+                return e;
+            }
+            if !is_hex_id(id) && !is_dec_id(id) {
+                e.push(err("id", "ID must be hex (e.g., \"0x123\") or decimal (e.g., \"291\")"));
+            } else if let Some(num) = parse_id(id) {
+                // Extended when explicitly set, else inferred from the id width
+                // (so the legacy editor, which doesn't pass `extended`, isn't
+                // newly rejected).
+                let extended = f.extended.unwrap_or(num > 0x7ff);
+                let max = if extended { 0x1FFF_FFFF } else { 0x7FF };
+                if num > max {
+                    e.push(err(
+                        "id",
+                        if extended {
+                            "Extended ID must be 0-536870911 (0x1FFFFFFF)"
+                        } else {
+                            "Standard ID must be 0-2047 (0x7FF)"
+                        },
+                    ));
+                }
+            }
+            if is_unique(id) {
+                e.push(err("id", format!("CAN frame with ID {id} already exists")));
+            }
+        }
+        "modbus" => {
+            if let Some(reg) = f.register_number {
+                if !(0..=65535).contains(&reg) {
+                    e.push(err("register_number", "Register number must be 0-65535"));
+                }
+            }
+            match f.device_address {
+                None => e.push(err("device_address", "Device address is required")),
+                Some(addr) if !(1..=247).contains(&addr) => {
+                    e.push(err("device_address", "Device address must be 1-247"));
+                }
+                _ => {}
+            }
+            if let Some(rt) = f.register_type.as_deref() {
+                if !matches!(rt, "holding" | "input" | "coil" | "discrete") {
+                    e.push(err(
+                        "register_type",
+                        "Register type must be: holding, input, coil, or discrete",
+                    ));
+                }
+            }
+            if let Some(rb) = f.register_base {
+                if rb != 0 && rb != 1 {
+                    e.push(err("register_base", "Register base must be 0 or 1"));
+                }
+            }
+            // Register comes from a numeric key OR an explicit register_number.
+            if parse_id(&f.key).is_none() && f.register_number.is_none() {
+                e.push(err(
+                    "register_number",
+                    "Name isn't a register — enter a register number, or name the frame by its register (e.g. 2581 or 0x32F9).",
+                ));
+            }
+        }
+        "serial" => {
+            let id = f.key.trim();
+            if id.is_empty() {
+                e.push(err("frame_id", "Frame identifier is required"));
+            } else if !is_hex_id(id) && !is_dec_id(id) && !is_identifier(id) {
+                e.push(err(
+                    "frame_id",
+                    "Frame identifier must be hex like \"0x123\", a decimal number, or a valid identifier",
+                ));
+            }
+            if !id.is_empty() && is_unique(id) {
+                e.push(err("frame_id", format!("Serial frame \"{id}\" already exists")));
+            }
+            if let Some(delim) = &f.delimiter {
+                if delim.iter().any(|b| !(0..=255).contains(b)) {
+                    e.push(err("delimiter", "Delimiter bytes must be integers 0-255"));
+                }
+            }
+        }
+        other => e.push(err("protocol", format!("Unknown protocol: {other}"))),
+    }
+    e
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,5 +851,125 @@ bit_length = 16
         let errs = validate("not = valid = toml =");
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].field, "toml");
+    }
+
+    #[test]
+    fn serial_frames_require_encoding() {
+        let with_frames = r#"
+[meta]
+name = "x"
+[frame.serial.heartbeat]
+length = 4
+"#;
+        let errs = validate(with_frames);
+        assert!(errs.iter().any(|e| e.field == "frame.serial.config.encoding"));
+        // Encoding present (in [meta.serial]) → no finding.
+        let ok = r#"
+[meta]
+name = "x"
+[meta.serial]
+encoding = "slip"
+[frame.serial.heartbeat]
+length = 4
+"#;
+        assert!(!validate(ok)
+            .iter()
+            .any(|e| e.field == "frame.serial.config.encoding"));
+    }
+
+    fn frame(json: serde_json::Value) -> Vec<ValidationError> {
+        validate_frame_fields(&serde_json::from_value(json).unwrap())
+    }
+
+    #[test]
+    fn can_frame_id_format_range_and_uniqueness() {
+        // Bad format.
+        assert!(frame(serde_json::json!({ "protocol": "can", "key": "xyz" }))
+            .iter()
+            .any(|e| e.field == "id"));
+        // Standard id out of range (extended explicitly false, as the generic
+        // editor sends it).
+        assert!(frame(serde_json::json!({ "protocol": "can", "key": "0x800", "extended": false }))
+            .iter()
+            .any(|e| e.message.contains("0x7FF")));
+        // Allowed up to 0x1FFFFFFF when extended.
+        assert!(frame(serde_json::json!({ "protocol": "can", "key": "0x800", "extended": true })).is_empty());
+        // Legacy path (no `extended`) infers from id width — not wrongly rejected.
+        assert!(frame(serde_json::json!({ "protocol": "can", "key": "0x18FF50E5" })).is_empty());
+        // Duplicate (not the original).
+        assert!(frame(serde_json::json!({
+            "protocol": "can", "key": "0x100",
+            "existingKeys": ["0x100"], "originalKey": "0x200"
+        }))
+        .iter()
+        .any(|e| e.message.contains("already exists")));
+        // Valid, editing the same key.
+        assert!(frame(serde_json::json!({
+            "protocol": "can", "key": "0x100",
+            "existingKeys": ["0x100"], "originalKey": "0x100"
+        }))
+        .is_empty());
+    }
+
+    #[test]
+    fn modbus_needs_register_and_bounds() {
+        // Non-numeric name + no register_number.
+        assert!(frame(serde_json::json!({
+            "protocol": "modbus", "key": "ems_control", "deviceAddress": 1
+        }))
+        .iter()
+        .any(|e| e.field == "register_number"));
+        // Numeric key supplies the register → ok.
+        assert!(frame(serde_json::json!({ "protocol": "modbus", "key": "2581", "deviceAddress": 1 })).is_empty());
+        // Bad device address.
+        assert!(frame(serde_json::json!({ "protocol": "modbus", "key": "2581", "deviceAddress": 999 }))
+            .iter()
+            .any(|e| e.field == "device_address"));
+    }
+
+    #[test]
+    fn transmitter_must_be_known_peer() {
+        let errs = frame(serde_json::json!({
+            "protocol": "can", "key": "0x100",
+            "transmitter": "Ghost", "availablePeers": ["ECU1", "ECU2"]
+        }));
+        assert!(errs.iter().any(|e| e.field == "transmitter"));
+    }
+
+    #[test]
+    fn signal_bounds() {
+        let bad: SignalInput = serde_json::from_value(serde_json::json!({
+            "name": "", "start_bit": -1, "bit_length": 0
+        }))
+        .unwrap();
+        let errs = validate_signal_fields(&bad);
+        assert!(errs.iter().any(|e| e.field == "signal.name"));
+        assert!(errs.iter().any(|e| e.field == "signal.start_bit"));
+        assert!(errs.iter().any(|e| e.field == "signal.bit_length"));
+        // String format allows longer bit lengths.
+        let ok: SignalInput = serde_json::from_value(serde_json::json!({
+            "name": "vin", "start_bit": 0, "bit_length": 136, "format": "ascii"
+        }))
+        .unwrap();
+        assert!(validate_signal_fields(&ok).is_empty());
+    }
+
+    #[test]
+    fn checksum_algorithm_and_range() {
+        let bad: ChecksumInput = serde_json::from_value(serde_json::json!({
+            "name": "crc", "algorithm": "made_up", "start_byte": 7, "byte_length": 1,
+            "calc_start_byte": 5, "calc_end_byte": 2, "frame_length": 8
+        }))
+        .unwrap();
+        let errs = validate_checksum_fields(&bad);
+        assert!(errs.iter().any(|e| e.field == "checksum.algorithm"));
+        assert!(errs.iter().any(|e| e.field == "checksum.calc_range"));
+        // Negative start byte resolves against frame length.
+        let ok: ChecksumInput = serde_json::from_value(serde_json::json!({
+            "name": "crc", "algorithm": "sum8", "start_byte": -1, "byte_length": 1,
+            "calc_start_byte": 0, "calc_end_byte": 7, "frame_length": 8
+        }))
+        .unwrap();
+        assert!(validate_checksum_fields(&ok).is_empty());
     }
 }

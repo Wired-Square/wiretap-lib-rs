@@ -202,8 +202,65 @@ fn parse_mux(mux: Option<&Value>) -> Option<Mux> {
         name: as_str(mux, "name").map(str::to_string),
         start_bit: as_u32(mux, "start_bit").unwrap_or(0),
         bit_length: as_u32(mux, "bit_length").unwrap_or(8),
+        default: as_str(mux, "default").map(str::to_string),
         cases,
     })
+}
+
+/// Normalise the `notes` key (a string or an array of strings) to a list.
+fn parse_notes(body: &Value) -> Vec<String> {
+    match get(body, "notes") {
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Parse a serial frame's `delimiter` byte array.
+fn parse_delimiter(body: &Value) -> Option<Vec<u8>> {
+    let arr = get(body, "delimiter")?.as_array()?;
+    let bytes: Vec<u8> = arr
+        .iter()
+        .filter_map(|v| v.as_integer().and_then(|i| u8::try_from(i).ok()))
+        .collect();
+    (!bytes.is_empty()).then_some(bytes)
+}
+
+/// Parse per-frame `[[…checksum]]` (array) or `[…checksum]` (single table).
+fn parse_frame_checksums(body: &Value) -> Vec<FrameChecksum> {
+    let one_checksum = |c: &Value| -> Option<FrameChecksum> {
+        Some(FrameChecksum {
+            name: as_str(c, "name").map(str::to_string),
+            algorithm: as_str(c, "algorithm")?.to_string(),
+            start_byte: as_u32(c, "start_byte")?,
+            byte_length: as_u32(c, "byte_length").unwrap_or(1),
+            endianness: endianness_at(c, "byte_order").or_else(|| endianness_at(c, "endianness")),
+            calc_start_byte: as_u32(c, "calc_start_byte").unwrap_or(0),
+            calc_end_byte: as_u32(c, "calc_end_byte"),
+        })
+    };
+    match get(body, "checksum") {
+        Some(Value::Array(a)) => a.iter().filter_map(one_checksum).collect(),
+        Some(t @ Value::Table(_)) => one_checksum(t).into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Parse the `[node]` table into ordered peer definitions.
+fn parse_nodes(root: &Value) -> Vec<NodeDef> {
+    let Some(table) = get(root, "node").and_then(Value::as_table) else {
+        return Vec::new();
+    };
+    table
+        .iter()
+        .map(|(name, body)| NodeDef {
+            name: name.clone(),
+            notes: parse_notes(body),
+        })
+        .collect()
 }
 
 /// Frame `tx.interval` / `tx.interval_ms` (either spelling).
@@ -560,6 +617,7 @@ fn modbus_frames(text: &str) -> Vec<Frame> {
                 count as u32 * 2
             };
             Frame {
+                key: f.name.clone(),
                 frame_id: f.register_number as u32,
                 protocol: Protocol::Modbus,
                 name: Some(f.name.clone()),
@@ -581,6 +639,12 @@ fn modbus_frames(text: &str) -> Vec<Frame> {
                 copy_from: None,
                 modbus_register_type: Some(f.register_type),
                 modbus_register_count: Some(f.length),
+                delimiter: None,
+                // notes + inherited_fields are filled by a post-pass in
+                // `parse()` (the manifest doesn't carry the raw frame body).
+                notes: Vec::new(),
+                checksums: Vec::new(),
+                inherited_fields: Vec::new(),
             }
         })
         .collect()
@@ -648,7 +712,38 @@ impl Catalog {
                 let is_fd = as_bool(body, "fd")
                     .or(can.as_ref().and_then(|c| c.default_fd))
                     .unwrap_or(false);
+                // Interval: explicit → copy/mirror source → catalogue default.
+                let default_interval = can.as_ref().and_then(|c| c.default_interval);
+                let interval = frame_interval(body)
+                    .or(resolved.inherited.interval)
+                    .or(default_interval);
+
+                // Track which fields were inherited rather than set explicitly
+                // (mirrors the per-protocol handlers in the TS catalog parser).
+                let mut inherited_fields = Vec::new();
+                if as_i64(body, "length").is_none() && resolved.inherited.length.is_some() {
+                    inherited_fields.push("length".to_string());
+                }
+                if as_str(body, "transmitter").is_none() && resolved.inherited.transmitter.is_some()
+                {
+                    inherited_fields.push("transmitter".to_string());
+                }
+                if frame_interval(body).is_none() && interval.is_some() {
+                    inherited_fields.push("interval".to_string());
+                }
+                // `extended` is inherited whenever not set explicitly (whether
+                // from the catalogue default or auto-detected from the id).
+                if as_bool(body, "extended").is_none() {
+                    inherited_fields.push("extended".to_string());
+                }
+                if as_bool(body, "fd").is_none()
+                    && can.as_ref().and_then(|c| c.default_fd).is_some()
+                {
+                    inherited_fields.push("fd".to_string());
+                }
+
                 frames.push(Frame {
+                    key: id_key.clone(),
                     frame_id: num_id,
                     protocol: Protocol::Can,
                     name: None,
@@ -656,7 +751,7 @@ impl Catalog {
                     transmitter: as_str(body, "transmitter")
                         .map(str::to_string)
                         .or(resolved.inherited.transmitter),
-                    interval: frame_interval(body).or(resolved.inherited.interval),
+                    interval,
                     bus: as_u32(body, "bus"),
                     is_extended: Some(is_extended),
                     is_fd: Some(is_fd),
@@ -666,6 +761,10 @@ impl Catalog {
                     copy_from: resolved.copy_from,
                     modbus_register_type: None,
                     modbus_register_count: None,
+                    delimiter: None,
+                    notes: parse_notes(body),
+                    checksums: parse_frame_checksums(body),
+                    inherited_fields,
                 });
             }
         }
@@ -680,6 +779,7 @@ impl Catalog {
                     continue;
                 };
                 frames.push(Frame {
+                    key: id_key.clone(),
                     frame_id: num_id,
                     protocol: Protocol::Serial,
                     name: None,
@@ -695,12 +795,37 @@ impl Catalog {
                     copy_from: None,
                     modbus_register_type: None,
                     modbus_register_count: None,
+                    delimiter: parse_delimiter(body),
+                    notes: parse_notes(body),
+                    checksums: parse_frame_checksums(body),
+                    inherited_fields: Vec::new(),
                 });
             }
         }
 
-        // Modbus frames (reuse ModbusManifest for shorthands).
+        // Modbus frames (reuse ModbusManifest for shorthands). The manifest
+        // drops the raw frame body, so backfill notes + inheritance flags from
+        // the `[frame.modbus]` table here (device address / register base come
+        // from `[meta.modbus]`, so they're always inherited when present).
+        let modbus_base = frames.len();
         frames.extend(modbus_frames(text));
+        let modbus_default_interval = modbus.as_ref().and_then(|m| m.default_interval);
+        for frame in &mut frames[modbus_base..] {
+            let body = get(modbus_frames_section, &frame.key);
+            frame.notes = body.map(parse_notes).unwrap_or_default();
+            let mut inherited = Vec::new();
+            if modbus.as_ref().and_then(|m| m.device_address).is_some() {
+                inherited.push("deviceAddress".to_string());
+            }
+            if modbus.as_ref().and_then(|m| m.register_base).is_some() {
+                inherited.push("registerBase".to_string());
+            }
+            let explicit_interval = body.and_then(frame_interval);
+            if explicit_interval.is_none() && modbus_default_interval.is_some() {
+                inherited.push("interval".to_string());
+            }
+            frame.inherited_fields = inherited;
+        }
 
         // Protocol determination (mirror TS).
         let has = |section: &Value| {
@@ -726,6 +851,7 @@ impl Catalog {
             serial,
             modbus,
             frames,
+            nodes: parse_nodes(&root),
         })
     }
 
@@ -744,6 +870,97 @@ mod tests {
             .iter()
             .find(|s| s.name.as_deref() == Some(name))
             .unwrap_or_else(|| panic!("signal {name} present"))
+    }
+
+    #[test]
+    fn preserves_authored_key_and_tracks_inheritance() {
+        let toml = r#"
+[meta]
+name = "x"
+[meta.can]
+default_interval = 500
+default_fd = true
+[frame.can.0x100]
+length = 8
+transmitter = "ECU1"
+[frame.can.0x101]
+copy = "0x100"
+"#;
+        let c = Catalog::parse(toml).unwrap();
+        let base = c.frame(0x100).unwrap();
+        assert_eq!(base.key, "0x100"); // authored key preserved (frame_id is numeric)
+        // 0x100: extended auto-detected, fd from default, interval from default.
+        assert!(base.inherited_fields.contains(&"extended".to_string()));
+        assert!(base.inherited_fields.contains(&"fd".to_string()));
+        assert!(base.inherited_fields.contains(&"interval".to_string()));
+        assert!(!base.inherited_fields.contains(&"length".to_string()));
+        // 0x101 copies 0x100: length + transmitter inherited from the copy source.
+        let cp = c.frame(0x101).unwrap();
+        assert_eq!(cp.length, 8);
+        assert_eq!(cp.transmitter.as_deref(), Some("ECU1"));
+        assert!(cp.inherited_fields.contains(&"length".to_string()));
+        assert!(cp.inherited_fields.contains(&"transmitter".to_string()));
+    }
+
+    #[test]
+    fn parses_frame_notes_both_forms_and_checksums() {
+        let toml = r#"
+[meta]
+name = "x"
+[frame.can.0x100]
+length = 8
+notes = "single note"
+[[frame.can.0x100.checksum]]
+algorithm = "sum8"
+start_byte = 7
+byte_length = 1
+calc_start_byte = 0
+calc_end_byte = 7
+[frame.can.0x200]
+length = 8
+notes = ["line one", "line two"]
+"#;
+        let c = Catalog::parse(toml).unwrap();
+        let f1 = c.frame(0x100).unwrap();
+        assert_eq!(f1.notes, vec!["single note".to_string()]);
+        assert_eq!(f1.checksums.len(), 1);
+        assert_eq!(f1.checksums[0].algorithm, "sum8");
+        assert_eq!(f1.checksums[0].start_byte, 7);
+        assert_eq!(f1.checksums[0].calc_end_byte, Some(7));
+        let f2 = c.frame(0x200).unwrap();
+        assert_eq!(f2.notes, vec!["line one".to_string(), "line two".to_string()]);
+    }
+
+    #[test]
+    fn parses_node_table_and_modbus_notes() {
+        let toml = r#"
+[meta]
+name = "x"
+[meta.modbus]
+device_address = 1
+default_interval = 1000
+[node.ECU_1]
+notes = "the main controller"
+[node.Sensor]
+[frame.modbus.ems_control]
+register_number = 13049
+register_type = "holding"
+length = 3
+notes = "energy management"
+"#;
+        let c = Catalog::parse(toml).unwrap();
+        // Nodes parsed in key order, notes carried.
+        let names: Vec<&str> = c.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, vec!["ECU_1", "Sensor"]);
+        assert_eq!(c.nodes[0].notes, vec!["the main controller".to_string()]);
+        // Modbus frame: key, notes, and inherited device address / interval.
+        let f = c.frames.iter().find(|f| f.key == "ems_control").unwrap();
+        assert_eq!(f.frame_id, 13049);
+        assert_eq!(f.modbus_register_type, Some(RegisterType::Holding));
+        assert_eq!(f.notes, vec!["energy management".to_string()]);
+        assert!(f.inherited_fields.contains(&"deviceAddress".to_string()));
+        // explicit frame interval absent → inherited from meta default.
+        assert!(f.inherited_fields.contains(&"interval".to_string()));
     }
 
     #[test]
