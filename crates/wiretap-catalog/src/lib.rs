@@ -16,6 +16,7 @@
 
 pub mod dbc;
 pub mod decode;
+pub mod edit;
 pub mod modbus;
 pub mod model;
 pub mod parse;
