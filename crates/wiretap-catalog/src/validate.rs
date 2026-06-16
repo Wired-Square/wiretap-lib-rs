@@ -639,6 +639,8 @@ pub struct FrameInput {
     pub device_address: Option<i64>,
     pub register_type: Option<String>,
     pub register_base: Option<i64>,
+    /// The slave node a register is read from (its address lives on the node).
+    pub node: Option<String>,
     // Serial
     pub delimiter: Option<Vec<i64>>,
     // Context
@@ -723,12 +725,18 @@ pub fn validate_frame_fields(f: &FrameInput) -> Vec<ValidationError> {
                     e.push(err("register_number", "Register number must be 0-65535"));
                 }
             }
-            match f.device_address {
-                None => e.push(err("device_address", "Device address is required")),
-                Some(addr) if !(1..=247).contains(&addr) => {
-                    e.push(err("device_address", "Device address must be 1-247"));
+            // The device address now lives on the node, not the register. Just
+            // check the referenced slave node exists (when peers are supplied).
+            if let Some(node) = f.node.as_deref().filter(|n| !n.is_empty()) {
+                if !f.available_peers.is_empty() && !f.available_peers.iter().any(|p| p == node) {
+                    e.push(err(
+                        "node",
+                        format!(
+                            "Slave must be one of the known nodes ({})",
+                            f.available_peers.join(", ")
+                        ),
+                    ));
                 }
-                _ => {}
             }
             if let Some(rt) = f.register_type.as_deref() {
                 if !matches!(rt, "holding" | "input" | "coil" | "discrete") {
@@ -947,21 +955,19 @@ length = 4
     fn modbus_needs_register_and_bounds() {
         // Non-numeric name + no register_number.
         assert!(frame(serde_json::json!({
-            "protocol": "modbus", "key": "ems_control", "deviceAddress": 1
+            "protocol": "modbus", "key": "ems_control"
         }))
         .iter()
         .any(|e| e.field == "register_number"));
-        // Numeric key supplies the register → ok.
-        assert!(frame(
-            serde_json::json!({ "protocol": "modbus", "key": "2581", "deviceAddress": 1 })
-        )
-        .is_empty());
-        // Bad device address.
-        assert!(frame(
-            serde_json::json!({ "protocol": "modbus", "key": "2581", "deviceAddress": 999 })
-        )
+        // Numeric key supplies the register → ok (no device address on the frame).
+        assert!(frame(serde_json::json!({ "protocol": "modbus", "key": "2581" })).is_empty());
+        // Register references an unknown slave node.
+        assert!(frame(serde_json::json!({
+            "protocol": "modbus", "key": "2581",
+            "node": "Ghost", "availablePeers": ["Slave 1"]
+        }))
         .iter()
-        .any(|e| e.field == "device_address"));
+        .any(|e| e.field == "node"));
     }
 
     #[test]

@@ -243,6 +243,14 @@ pub struct Frame {
     /// Modbus-specific: register count (not bytes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modbus_register_count: Option<u16>,
+    /// Modbus-specific: the slave node this register is read from
+    /// (`[frame.modbus.<name>].node` → `[node.<name>]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modbus_node: Option<String>,
+    /// Modbus-specific: resolved device (slave) address — from the assigned
+    /// node, the legacy `[meta.modbus].device_address`, else `1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modbus_device_address: Option<u8>,
     /// Serial-specific: explicit frame delimiter bytes (raw encoding).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delimiter: Option<Vec<u8>>,
@@ -402,6 +410,10 @@ pub struct Meta {
 #[serde(rename_all = "camelCase")]
 pub struct NodeDef {
     pub name: String,
+    /// Modbus-specific: the device (slave) address this node owns
+    /// (`[node.<name>].device_address`). `None` for CAN/serial nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_address: Option<u8>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
 }

@@ -260,6 +260,7 @@ fn parse_nodes(root: &Value) -> Vec<NodeDef> {
         .iter()
         .map(|(name, body)| NodeDef {
             name: name.clone(),
+            device_address: as_i64(body, "device_address").and_then(|i| u8::try_from(i).ok()),
             notes: parse_notes(body),
         })
         .collect()
@@ -641,6 +642,8 @@ fn modbus_frames(text: &str) -> Vec<Frame> {
                 copy_from: None,
                 modbus_register_type: Some(f.register_type),
                 modbus_register_count: Some(f.length),
+                modbus_node: f.node.clone(),
+                modbus_device_address: Some(f.device_address),
                 delimiter: None,
                 // notes + inherited_fields are filled by a post-pass in
                 // `parse()` (the manifest doesn't carry the raw frame body).
@@ -763,6 +766,8 @@ impl Catalog {
                     copy_from: resolved.copy_from,
                     modbus_register_type: None,
                     modbus_register_count: None,
+                    modbus_node: None,
+                    modbus_device_address: None,
                     delimiter: None,
                     notes: parse_notes(body),
                     checksums: parse_frame_checksums(body),
@@ -797,6 +802,8 @@ impl Catalog {
                     copy_from: None,
                     modbus_register_type: None,
                     modbus_register_count: None,
+                    modbus_node: None,
+                    modbus_device_address: None,
                     delimiter: parse_delimiter(body),
                     notes: parse_notes(body),
                     checksums: parse_frame_checksums(body),
@@ -816,7 +823,10 @@ impl Catalog {
             let body = get(modbus_frames_section, &frame.key);
             frame.notes = body.map(parse_notes).unwrap_or_default();
             let mut inherited = Vec::new();
-            if modbus.as_ref().and_then(|m| m.device_address).is_some() {
+            // The device address is never set on the register itself — it's
+            // resolved from the assigned node (or the legacy `[meta.modbus]`
+            // default), so it's always inherited.
+            if frame.modbus_device_address.is_some() {
                 inherited.push("deviceAddress".to_string());
             }
             if modbus.as_ref().and_then(|m| m.register_base).is_some() {
@@ -846,6 +856,30 @@ impl Catalog {
             None => Protocol::Can,
         };
 
+        // Migration: a legacy modbus catalogue carries its slave address on
+        // `[meta.modbus].device_address` with no `[node]` tables. Synthesise a
+        // slave node and attach the orphaned registers to it so the editor shows
+        // them grouped (display-only until the catalogue is re-saved).
+        let mut nodes = parse_nodes(&root);
+        if has_modbus && nodes.is_empty() {
+            if let Some(addr) = frames[modbus_base..]
+                .iter()
+                .find_map(|f| f.modbus_device_address)
+            {
+                let name = format!("Slave {addr}");
+                for frame in &mut frames[modbus_base..] {
+                    if frame.modbus_node.is_none() {
+                        frame.modbus_node = Some(name.clone());
+                    }
+                }
+                nodes.push(NodeDef {
+                    name,
+                    device_address: Some(addr),
+                    notes: Vec::new(),
+                });
+            }
+        }
+
         Ok(Catalog {
             meta,
             protocol,
@@ -853,7 +887,7 @@ impl Catalog {
             serial,
             modbus,
             frames,
-            nodes: parse_nodes(&root),
+            nodes,
         })
     }
 
@@ -902,6 +936,70 @@ copy = "0x100"
         assert_eq!(cp.transmitter.as_deref(), Some("ECU1"));
         assert!(cp.inherited_fields.contains(&"length".to_string()));
         assert!(cp.inherited_fields.contains(&"transmitter".to_string()));
+    }
+
+    #[test]
+    fn modbus_register_resolves_address_from_its_node() {
+        let toml = r#"
+[meta]
+name = "x"
+default_frame = "modbus"
+[meta.modbus]
+register_base = 0
+[node."Slave 1"]
+device_address = 1
+[node.Battery]
+device_address = 3
+[frame.modbus.grid_power]
+register_number = 5083
+node = "Slave 1"
+[frame.modbus.battery_soc]
+register_number = 13022
+node = "Battery"
+"#;
+        let c = Catalog::parse(toml).unwrap();
+        let grid = c.frame(5083).unwrap();
+        assert_eq!(grid.modbus_node.as_deref(), Some("Slave 1"));
+        assert_eq!(grid.modbus_device_address, Some(1));
+        let batt = c.frame(13022).unwrap();
+        assert_eq!(batt.modbus_node.as_deref(), Some("Battery"));
+        assert_eq!(batt.modbus_device_address, Some(3));
+        // The device address is resolved (from the node), so it's inherited.
+        assert!(batt.inherited_fields.contains(&"deviceAddress".to_string()));
+        // Both declared nodes survive, each carrying its address.
+        assert_eq!(c.nodes.len(), 2);
+        assert_eq!(
+            c.nodes
+                .iter()
+                .find(|n| n.name == "Battery")
+                .unwrap()
+                .device_address,
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn legacy_modbus_meta_address_migrates_to_a_slave_node() {
+        // No [node] tables, address only on [meta.modbus] — the legacy form.
+        let toml = r#"
+[meta]
+name = "x"
+default_frame = "modbus"
+[meta.modbus]
+device_address = 5
+register_base = 0
+[frame.modbus.grid_power]
+register_number = 5083
+"#;
+        let c = Catalog::parse(toml).unwrap();
+        // A slave node is synthesised from the legacy address...
+        assert_eq!(c.nodes.len(), 1);
+        let node = &c.nodes[0];
+        assert_eq!(node.device_address, Some(5));
+        // ...and the orphaned register is attached to it and resolves the address.
+        let f = c.frame(5083).unwrap();
+        assert_eq!(f.modbus_device_address, Some(5));
+        assert_eq!(f.modbus_node.as_deref(), Some(node.name.as_str()));
     }
 
     #[test]

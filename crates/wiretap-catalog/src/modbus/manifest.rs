@@ -158,6 +158,11 @@ pub struct ModbusFrame {
     /// (e.g. "Illegal data address") — toggled from the health panel,
     /// written into the manifest by [`set_frame_disabled`].
     pub disabled: bool,
+    /// The slave node this register is read from (`[frame.modbus.<name>].node`).
+    pub node: Option<String>,
+    /// Resolved device (slave) address: the assigned node's address, the legacy
+    /// `[meta.modbus].device_address`, else `1`.
+    pub device_address: u8,
     pub signals: Vec<ModbusSignal>,
 }
 
@@ -208,6 +213,15 @@ impl ModbusManifest {
         let meta = raw.meta.modbus;
         let default_interval = meta.default_interval_ms.unwrap_or(DEFAULT_INTERVAL_MS);
 
+        // Address resolution: a register's address comes from its assigned node;
+        // legacy catalogues without nodes fall back to `[meta.modbus]`.
+        let node_addrs: BTreeMap<&str, u8> = raw
+            .node
+            .iter()
+            .filter_map(|(name, n)| n.device_address.map(|a| (name.as_str(), a)))
+            .collect();
+        let legacy_address = meta.device_address;
+
         // BTreeMap iteration is sorted by frame name, giving stable
         // ordering for the role pickers and the tests.
         let frames: Vec<ModbusFrame> = raw
@@ -233,6 +247,11 @@ impl ModbusManifest {
                 } else {
                     f.signals
                 };
+                let device_address = f
+                    .node
+                    .as_deref()
+                    .and_then(|n| node_addrs.get(n).copied())
+                    .unwrap_or(legacy_address);
                 Ok(ModbusFrame {
                     name,
                     register_number,
@@ -240,6 +259,8 @@ impl ModbusManifest {
                     length: f.length,
                     interval_ms: f.tx.and_then(|t| t.interval_ms).unwrap_or(default_interval),
                     disabled: f.disabled,
+                    node: f.node,
+                    device_address,
                     signals,
                 })
             })
@@ -627,6 +648,15 @@ struct RawManifest {
     meta: RawMeta,
     #[serde(default)]
     frame: RawFrames,
+    /// `[node.<name>]` tables. A Modbus node owns a `device_address`.
+    #[serde(default)]
+    node: BTreeMap<String, RawNode>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawNode {
+    #[serde(default)]
+    device_address: Option<u8>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -660,6 +690,9 @@ struct RawFrame {
     tx: Option<RawTx>,
     #[serde(default)]
     disabled: bool,
+    /// The slave node this register is read from.
+    #[serde(default)]
+    node: Option<String>,
     #[serde(default)]
     signals: Vec<ModbusSignal>,
     // ---- frame-level signal shorthand (used only when `signals` is empty) ----

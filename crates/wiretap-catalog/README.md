@@ -60,7 +60,11 @@ name = "Sungrow SHx"
 register_base = 0            # 0 = IEC/0-based, 1 = traditional 3xxxx/4xxxx
 default_word_order = "little"
 
+[node."Slave 1"]            # a Modbus slave; it owns the device address
+device_address = 1
+
 [frame.modbus.battery_status]   # one Modbus read of a register block
+node = "Slave 1"                # which slave this register is read from
 register_number = 13019
 register_type = "input"         # input | holding | coil | discrete
 length = 9                      # register count
@@ -72,6 +76,17 @@ bit_length = 16
 factor = 0.1
 unit = "%"
 ```
+
+### Modbus slaves (nodes)
+
+- **The slave owns the device address** — declare each slave as `[node.<name>]`
+  with a `device_address`, and point a register at it with `node = "<name>"`.
+  One catalogue can describe several slaves, each polled at its own address.
+- **Legacy fallback + migration** — an older catalogue that set
+  `[meta.modbus].device_address` and declared no nodes still parses: every
+  register resolves that address, and a slave node is synthesised from it (with
+  the orphaned registers attached) so the editor shows them grouped. A register
+  with no `node` falls back to the legacy address, else `1`.
 
 ### Modbus shorthands
 

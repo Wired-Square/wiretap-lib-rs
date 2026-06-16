@@ -419,20 +419,30 @@ fn op_rename_key(
     Ok(())
 }
 
+/// On node rename, rewrite the references that point at it: CAN frames carry the
+/// node in `transmitter`, Modbus registers in `node`.
 fn update_transmitter_references(doc: &mut DocumentMut, old: &str, new: &str) {
-    let Some(can) = doc
+    let Some(frame) = doc
         .as_table_mut()
         .get_mut("frame")
-        .and_then(Item::as_table_mut)
-        .and_then(|f| f.get_mut("can"))
         .and_then(Item::as_table_mut)
     else {
         return;
     };
-    for (_k, item) in can.iter_mut() {
+    rewrite_ref_field(frame.get_mut("can"), "transmitter", old, new);
+    rewrite_ref_field(frame.get_mut("modbus"), "node", old, new);
+}
+
+/// Rewrite `field = "old"` → `field = "new"` across every child table of a
+/// `[frame.<protocol>]` section.
+fn rewrite_ref_field(section: Option<&mut Item>, field: &str, old: &str, new: &str) {
+    let Some(table) = section.and_then(Item::as_table_mut) else {
+        return;
+    };
+    for (_k, item) in table.iter_mut() {
         if let Some(tbl) = item.as_table_mut() {
-            if tbl.get("transmitter").and_then(|i| i.as_str()) == Some(old) {
-                tbl.insert("transmitter", toml_edit::value(new));
+            if tbl.get(field).and_then(|i| i.as_str()) == Some(old) {
+                tbl.insert(field, toml_edit::value(new));
             }
         }
     }
