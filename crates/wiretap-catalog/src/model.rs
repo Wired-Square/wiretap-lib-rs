@@ -155,6 +155,9 @@ pub struct MuxCase {
     pub signals: Vec<Signal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mux: Option<Box<Mux>>,
+    /// Free-text notes on the case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// A multiplexer: a selector bit-field plus the per-case signal sets. Case keys
@@ -170,6 +173,9 @@ pub struct Mux {
     /// The default case key applied when the selector matches no explicit case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
+    /// Free-text notes on the multiplexer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     pub cases: BTreeMap<String, MuxCase>,
 }
 

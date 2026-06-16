@@ -195,6 +195,7 @@ fn parse_mux(mux: Option<&Value>) -> Option<Mux> {
             MuxCase {
                 signals,
                 mux: nested,
+                notes: parse_notes(case_data),
             },
         );
     }
@@ -203,6 +204,7 @@ fn parse_mux(mux: Option<&Value>) -> Option<Mux> {
         start_bit: as_u32(mux, "start_bit").unwrap_or(0),
         bit_length: as_u32(mux, "bit_length").unwrap_or(8),
         default: as_str(mux, "default").map(str::to_string),
+        notes: parse_notes(mux),
         cases,
     })
 }
@@ -1142,6 +1144,33 @@ bit_length = 8
         assert_eq!(
             nested.cases.get("0").unwrap().signals[0].name.as_deref(),
             Some("deep")
+        );
+    }
+
+    #[test]
+    fn parses_mux_and_case_notes() {
+        let toml = r#"
+[meta]
+name = "x"
+[frame.can.0x300]
+length = 8
+[frame.can.0x300.mux]
+name = "sel"
+start_bit = 0
+bit_length = 8
+notes = "the selector"
+[frame.can.0x300.mux."0"]
+notes = ["case zero", "second line"]
+[[frame.can.0x300.mux."0".signals]]
+name = "a"
+start_bit = 8
+bit_length = 8
+"#;
+        let m = Catalog::parse(toml).unwrap().frame(0x300).unwrap().mux.clone().unwrap();
+        assert_eq!(m.notes, vec!["the selector".to_string()]);
+        assert_eq!(
+            m.cases.get("0").unwrap().notes,
+            vec!["case zero".to_string(), "second line".to_string()]
         );
     }
 
