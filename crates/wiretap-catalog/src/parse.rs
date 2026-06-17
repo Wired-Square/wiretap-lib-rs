@@ -266,11 +266,15 @@ fn parse_nodes(root: &Value) -> Vec<NodeDef> {
         .collect()
 }
 
-/// Frame `tx.interval` / `tx.interval_ms` (either spelling).
+/// Frame poll/tx interval: the canonical top-level `interval_ms` (or `interval`),
+/// falling back to the legacy `tx.interval_ms` / `tx.interval`.
 fn frame_interval(body: &Value) -> Option<u64> {
-    let tx = get(body, "tx")?;
-    as_i64(tx, "interval")
-        .or_else(|| as_i64(tx, "interval_ms"))
+    as_i64(body, "interval_ms")
+        .or_else(|| as_i64(body, "interval"))
+        .or_else(|| {
+            let tx = get(body, "tx")?;
+            as_i64(tx, "interval_ms").or_else(|| as_i64(tx, "interval"))
+        })
         .and_then(|i| u64::try_from(i).ok())
 }
 
@@ -866,7 +870,7 @@ impl Catalog {
                 .iter()
                 .find_map(|f| f.modbus_device_address)
             {
-                let name = format!("Slave {addr}");
+                let name = crate::migrate::slave_node_name(addr);
                 for frame in &mut frames[modbus_base..] {
                     if frame.modbus_node.is_none() {
                         frame.modbus_node = Some(name.clone());
@@ -952,10 +956,10 @@ device_address = 1
 device_address = 3
 [frame.modbus.grid_power]
 register_number = 5083
-node = "Slave 1"
+node_address = 1
 [frame.modbus.battery_soc]
 register_number = 13022
-node = "Battery"
+node_address = 3
 "#;
         let c = Catalog::parse(toml).unwrap();
         let grid = c.frame(5083).unwrap();

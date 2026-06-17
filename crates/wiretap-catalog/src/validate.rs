@@ -639,8 +639,8 @@ pub struct FrameInput {
     pub device_address: Option<i64>,
     pub register_type: Option<String>,
     pub register_base: Option<i64>,
-    /// The slave node a register is read from (its address lives on the node).
-    pub node: Option<String>,
+    /// The device (slave) address a register is read from; matched to a node.
+    pub node_address: Option<i64>,
     // Serial
     pub delimiter: Option<Vec<i64>>,
     // Context
@@ -725,16 +725,14 @@ pub fn validate_frame_fields(f: &FrameInput) -> Vec<ValidationError> {
                     e.push(err("register_number", "Register number must be 0-65535"));
                 }
             }
-            // The device address now lives on the node, not the register. Just
-            // check the referenced slave node exists (when peers are supplied).
-            if let Some(node) = f.node.as_deref().filter(|n| !n.is_empty()) {
-                if !f.available_peers.is_empty() && !f.available_peers.iter().any(|p| p == node) {
+            // A register names its slave by address (matched to a node by
+            // `device_address`). Valid Modbus slave addresses are 1-247
+            // (0 is broadcast, 248-255 reserved).
+            if let Some(addr) = f.node_address {
+                if !(1..=247).contains(&addr) {
                     e.push(err(
-                        "node",
-                        format!(
-                            "Slave must be one of the known nodes ({})",
-                            f.available_peers.join(", ")
-                        ),
+                        "node_address",
+                        "Slave address must be between 1 and 247",
                     ));
                 }
             }
@@ -961,13 +959,17 @@ length = 4
         .any(|e| e.field == "register_number"));
         // Numeric key supplies the register → ok (no device address on the frame).
         assert!(frame(serde_json::json!({ "protocol": "modbus", "key": "2581" })).is_empty());
-        // Register references an unknown slave node.
+        // A valid slave address is accepted.
         assert!(frame(serde_json::json!({
-            "protocol": "modbus", "key": "2581",
-            "node": "Ghost", "availablePeers": ["Slave 1"]
+            "protocol": "modbus", "key": "2581", "nodeAddress": 1
+        }))
+        .is_empty());
+        // An out-of-range slave address is rejected.
+        assert!(frame(serde_json::json!({
+            "protocol": "modbus", "key": "2581", "nodeAddress": 300
         }))
         .iter()
-        .any(|e| e.field == "node"));
+        .any(|e| e.field == "node_address"));
     }
 
     #[test]

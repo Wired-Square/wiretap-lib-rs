@@ -158,9 +158,12 @@ pub struct ModbusFrame {
     /// (e.g. "Illegal data address") — toggled from the health panel,
     /// written into the manifest by [`set_frame_disabled`].
     pub disabled: bool,
-    /// The slave node this register is read from (`[frame.modbus.<name>].node`).
+    /// Resolved display name of the slave this register belongs to: the
+    /// `[node.<name>]` table whose `device_address` matches [`Self::device_address`],
+    /// if any. `None` for an unmatched address. Registers reference their slave by
+    /// address (`node_address`), not by name.
     pub node: Option<String>,
-    /// Resolved device (slave) address: the assigned node's address, the legacy
+    /// Device (slave) address: the register's `node_address`, the legacy
     /// `[meta.modbus].device_address`, else `1`.
     pub device_address: u8,
     pub signals: Vec<ModbusSignal>,
@@ -213,12 +216,14 @@ impl ModbusManifest {
         let meta = raw.meta.modbus;
         let default_interval = meta.default_interval_ms.unwrap_or(DEFAULT_INTERVAL_MS);
 
-        // Address resolution: a register's address comes from its assigned node;
-        // legacy catalogues without nodes fall back to `[meta.modbus]`.
-        let node_addrs: BTreeMap<&str, u8> = raw
+        // Address resolution: a register names its slave's address directly via
+        // `node_address`; the `[node.<name>]` table maps that address to a display
+        // name. Legacy catalogues without `node_address` fall back to
+        // `[meta.modbus]`.
+        let addr_to_name: BTreeMap<u8, &str> = raw
             .node
             .iter()
-            .filter_map(|(name, n)| n.device_address.map(|a| (name.as_str(), a)))
+            .filter_map(|(name, n)| n.device_address.map(|a| (a, name.as_str())))
             .collect();
         let legacy_address = meta.device_address;
 
@@ -247,19 +252,18 @@ impl ModbusManifest {
                 } else {
                     f.signals
                 };
-                let device_address = f
-                    .node
-                    .as_deref()
-                    .and_then(|n| node_addrs.get(n).copied())
-                    .unwrap_or(legacy_address);
+                let device_address = f.node_address.unwrap_or(legacy_address);
                 Ok(ModbusFrame {
                     name,
                     register_number,
                     register_type: f.register_type,
                     length: f.length,
-                    interval_ms: f.tx.and_then(|t| t.interval_ms).unwrap_or(default_interval),
+                    interval_ms: f
+                        .interval_ms
+                        .or_else(|| f.tx.and_then(|t| t.interval_ms))
+                        .unwrap_or(default_interval),
                     disabled: f.disabled,
-                    node: f.node,
+                    node: addr_to_name.get(&device_address).map(|s| s.to_string()),
                     device_address,
                     signals,
                 })
@@ -686,13 +690,18 @@ struct RawFrame {
     register_type: RegisterType,
     #[serde(default = "default_length")]
     length: u16,
+    /// Canonical poll interval (ms). The legacy `[tx]` sub-table is still
+    /// accepted as a fallback (see [`RawTx`]).
+    #[serde(default, alias = "interval")]
+    interval_ms: Option<u64>,
     #[serde(default)]
     tx: Option<RawTx>,
     #[serde(default)]
     disabled: bool,
-    /// The slave node this register is read from.
+    /// The device (slave) address this register is read from. Matched to a
+    /// `[node.<name>]` table by `device_address` for display/grouping.
     #[serde(default)]
-    node: Option<String>,
+    node_address: Option<u8>,
     #[serde(default)]
     signals: Vec<ModbusSignal>,
     // ---- frame-level signal shorthand (used only when `signals` is empty) ----
