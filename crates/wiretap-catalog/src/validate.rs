@@ -100,7 +100,9 @@ fn validate_serial_encoding(
         .and_then(Value::as_table)
         .and_then(|m| m.get("serial"))
         .and_then(Value::as_table);
-    let frame_serial_config = serial.and_then(|s| s.get("config")).and_then(Value::as_table);
+    let frame_serial_config = serial
+        .and_then(|s| s.get("config"))
+        .and_then(Value::as_table);
     if !encoding_in(meta_serial) && !encoding_in(frame_serial_config) {
         errors.push(err(
             "frame.serial.config.encoding",
@@ -454,7 +456,10 @@ pub fn validate_signal_fields(s: &SignalInput) -> Vec<ValidationError> {
     }
     if let Some(end) = s.endianness.as_deref() {
         if end != "little" && end != "big" {
-            e.push(err("signal.endianness", "Endianness must be \"little\" or \"big\""));
+            e.push(err(
+                "signal.endianness",
+                "Endianness must be \"little\" or \"big\"",
+            ));
         }
     }
     if let (Some(min), Some(max)) = (s.min, s.max) {
@@ -504,7 +509,10 @@ pub fn validate_checksum_fields(c: &ChecksumInput) -> Vec<ValidationError> {
     if !CHECKSUM_ALGORITHMS.contains(&c.algorithm.as_str()) {
         e.push(err(
             "checksum.algorithm",
-            format!("Algorithm must be one of: {}", CHECKSUM_ALGORITHMS.join(", ")),
+            format!(
+                "Algorithm must be one of: {}",
+                CHECKSUM_ALGORITHMS.join(", ")
+            ),
         ));
     }
 
@@ -517,7 +525,10 @@ pub fn validate_checksum_fields(c: &ChecksumInput) -> Vec<ValidationError> {
                 e.push(err(
                     "checksum.start_byte",
                     if sb < 0 {
-                        format!("Start byte {sb} resolves to {resolved}, which is out of range [0, {}]", frame_length - 1)
+                        format!(
+                            "Start byte {sb} resolves to {resolved}, which is out of range [0, {}]",
+                            frame_length - 1
+                        )
                     } else {
                         format!("Start byte must be less than frame length ({frame_length})")
                     },
@@ -548,7 +559,10 @@ pub fn validate_checksum_fields(c: &ChecksumInput) -> Vec<ValidationError> {
 
     if let Some(end) = c.endianness.as_deref() {
         if end != "little" && end != "big" {
-            e.push(err("checksum.endianness", "Endianness must be \"little\" or \"big\""));
+            e.push(err(
+                "checksum.endianness",
+                "Endianness must be \"little\" or \"big\"",
+            ));
         }
     }
 
@@ -642,7 +656,10 @@ pub fn validate_frame_fields(f: &FrameInput) -> Vec<ValidationError> {
     let max_len = f.max_length.unwrap_or(64);
     if let Some(len) = f.length {
         if len < 0 || len > max_len {
-            e.push(err("length", format!("Length must be between 0 and {max_len}")));
+            e.push(err(
+                "length",
+                format!("Length must be between 0 and {max_len}"),
+            ));
         }
     }
     if let Some(iv) = f.interval {
@@ -675,7 +692,10 @@ pub fn validate_frame_fields(f: &FrameInput) -> Vec<ValidationError> {
                 return e;
             }
             if !is_hex_id(id) && !is_dec_id(id) {
-                e.push(err("id", "ID must be hex (e.g., \"0x123\") or decimal (e.g., \"291\")"));
+                e.push(err(
+                    "id",
+                    "ID must be hex (e.g., \"0x123\") or decimal (e.g., \"291\")",
+                ));
             } else if let Some(num) = parse_id(id) {
                 // Extended when explicitly set, else inferred from the id width
                 // (so the legacy editor, which doesn't pass `extended`, isn't
@@ -742,7 +762,10 @@ pub fn validate_frame_fields(f: &FrameInput) -> Vec<ValidationError> {
                 ));
             }
             if !id.is_empty() && is_unique(id) {
-                e.push(err("frame_id", format!("Serial frame \"{id}\" already exists")));
+                e.push(err(
+                    "frame_id",
+                    format!("Serial frame \"{id}\" already exists"),
+                ));
             }
             if let Some(delim) = &f.delimiter {
                 if delim.iter().any(|b| !(0..=255).contains(b)) {
@@ -862,7 +885,9 @@ name = "x"
 length = 4
 "#;
         let errs = validate(with_frames);
-        assert!(errs.iter().any(|e| e.field == "frame.serial.config.encoding"));
+        assert!(errs
+            .iter()
+            .any(|e| e.field == "frame.serial.config.encoding"));
         // Encoding present (in [meta.serial]) → no finding.
         let ok = r#"
 [meta]
@@ -884,16 +909,23 @@ length = 4
     #[test]
     fn can_frame_id_format_range_and_uniqueness() {
         // Bad format.
-        assert!(frame(serde_json::json!({ "protocol": "can", "key": "xyz" }))
-            .iter()
-            .any(|e| e.field == "id"));
+        assert!(
+            frame(serde_json::json!({ "protocol": "can", "key": "xyz" }))
+                .iter()
+                .any(|e| e.field == "id")
+        );
         // Standard id out of range (extended explicitly false, as the generic
         // editor sends it).
-        assert!(frame(serde_json::json!({ "protocol": "can", "key": "0x800", "extended": false }))
-            .iter()
-            .any(|e| e.message.contains("0x7FF")));
+        assert!(
+            frame(serde_json::json!({ "protocol": "can", "key": "0x800", "extended": false }))
+                .iter()
+                .any(|e| e.message.contains("0x7FF"))
+        );
         // Allowed up to 0x1FFFFFFF when extended.
-        assert!(frame(serde_json::json!({ "protocol": "can", "key": "0x800", "extended": true })).is_empty());
+        assert!(
+            frame(serde_json::json!({ "protocol": "can", "key": "0x800", "extended": true }))
+                .is_empty()
+        );
         // Legacy path (no `extended`) infers from id width — not wrongly rejected.
         assert!(frame(serde_json::json!({ "protocol": "can", "key": "0x18FF50E5" })).is_empty());
         // Duplicate (not the original).
@@ -920,11 +952,16 @@ length = 4
         .iter()
         .any(|e| e.field == "register_number"));
         // Numeric key supplies the register → ok.
-        assert!(frame(serde_json::json!({ "protocol": "modbus", "key": "2581", "deviceAddress": 1 })).is_empty());
+        assert!(frame(
+            serde_json::json!({ "protocol": "modbus", "key": "2581", "deviceAddress": 1 })
+        )
+        .is_empty());
         // Bad device address.
-        assert!(frame(serde_json::json!({ "protocol": "modbus", "key": "2581", "deviceAddress": 999 }))
-            .iter()
-            .any(|e| e.field == "device_address"));
+        assert!(frame(
+            serde_json::json!({ "protocol": "modbus", "key": "2581", "deviceAddress": 999 })
+        )
+        .iter()
+        .any(|e| e.field == "device_address"));
     }
 
     #[test]

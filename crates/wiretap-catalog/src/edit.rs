@@ -133,7 +133,10 @@ pub fn apply_edit(text: &str, op: EditOp) -> Result<String, String> {
                 return Ok(doc.to_string());
             }
             if exists && error_if_exists {
-                return Err(format!("'{}' already exists", path.last().map_or("", |s| s)));
+                return Err(format!(
+                    "'{}' already exists",
+                    path.last().map_or("", |s| s)
+                ));
             }
             let tbl = navigate_create(doc.as_table_mut(), &path);
             if replace_contents {
@@ -289,7 +292,12 @@ fn op_upsert_array_item(
     Ok(())
 }
 
-fn upsert_aot(aot: &mut ArrayOfTables, value: &JsonMap, index: Option<usize>, sort_keys: &[String]) {
+fn upsert_aot(
+    aot: &mut ArrayOfTables,
+    value: &JsonMap,
+    index: Option<usize>,
+    sort_keys: &[String],
+) {
     // Rebuild from clones: toml_edit has no positional insert for an
     // array-of-tables, but each cloned `Table` carries its decor (the leading
     // `#` comment block), so re-pushing in the new order reproduces existing
@@ -495,7 +503,9 @@ fn scalar_eq(item: &Item, json: &Json) -> bool {
 }
 
 fn json_scalar_item(key: &str, json: &Json) -> Item {
-    json_to_value(key, json).map(Item::Value).unwrap_or(Item::None)
+    json_to_value(key, json)
+        .map(Item::Value)
+        .unwrap_or(Item::None)
 }
 
 fn json_array_item(items: &[Json]) -> Item {
@@ -674,7 +684,10 @@ fn sorted_pos_inline(arr: &Array, value: &JsonMap, sort_keys: &[String]) -> usiz
 
 fn cmp_tables(a: &Table, b: &Table, keys: &[String]) -> Ordering {
     for k in keys {
-        let o = cmp_value(a.get(k).and_then(Item::as_value), b.get(k).and_then(Item::as_value));
+        let o = cmp_value(
+            a.get(k).and_then(Item::as_value),
+            b.get(k).and_then(Item::as_value),
+        );
         if o != Ordering::Equal {
             return o;
         }

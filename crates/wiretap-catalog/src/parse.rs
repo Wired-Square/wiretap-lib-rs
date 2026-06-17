@@ -891,7 +891,7 @@ copy = "0x100"
         let c = Catalog::parse(toml).unwrap();
         let base = c.frame(0x100).unwrap();
         assert_eq!(base.key, "0x100"); // authored key preserved (frame_id is numeric)
-        // 0x100: extended auto-detected, fd from default, interval from default.
+                                       // 0x100: extended auto-detected, fd from default, interval from default.
         assert!(base.inherited_fields.contains(&"extended".to_string()));
         assert!(base.inherited_fields.contains(&"fd".to_string()));
         assert!(base.inherited_fields.contains(&"interval".to_string()));
@@ -930,7 +930,10 @@ notes = ["line one", "line two"]
         assert_eq!(f1.checksums[0].start_byte, 7);
         assert_eq!(f1.checksums[0].calc_end_byte, Some(7));
         let f2 = c.frame(0x200).unwrap();
-        assert_eq!(f2.notes, vec!["line one".to_string(), "line two".to_string()]);
+        assert_eq!(
+            f2.notes,
+            vec!["line one".to_string(), "line two".to_string()]
+        );
     }
 
     #[test]
@@ -1166,7 +1169,13 @@ name = "a"
 start_bit = 8
 bit_length = 8
 "#;
-        let m = Catalog::parse(toml).unwrap().frame(0x300).unwrap().mux.clone().unwrap();
+        let m = Catalog::parse(toml)
+            .unwrap()
+            .frame(0x300)
+            .unwrap()
+            .mux
+            .clone()
+            .unwrap();
         assert_eq!(m.notes, vec!["the selector".to_string()]);
         assert_eq!(
             m.cases.get("0").unwrap().notes,

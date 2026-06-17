@@ -144,7 +144,11 @@ fn add_signal_with_enum_subtable_round_trips() {
     );
     let cat = crate::Catalog::parse(&out).expect("parses");
     let f = cat.frames.iter().find(|f| f.frame_id == 0x10).unwrap();
-    let sig = f.signals.iter().find(|s| s.name.as_deref() == Some("mode")).unwrap();
+    let sig = f
+        .signals
+        .iter()
+        .find(|s| s.name.as_deref() == Some("mode"))
+        .unwrap();
     let enum_map = sig.enum_map.as_ref().expect("enum map present");
     assert_eq!(enum_map.get(&0).map(String::as_str), Some("off"));
     assert_eq!(enum_map.get(&2).map(String::as_str), Some("on"));
@@ -155,7 +159,11 @@ fn add_signal_with_enum_subtable_round_trips() {
 #[test]
 fn frame_id_mask_renders_as_hex() {
     let toml = "[meta]\nname = \"d\"\nversion = 1\n";
-    for (mask, expect) in [(0xFFu64, "0xFF"), (0xFF00, "0xFF00"), (0x1FFF_FF00, "0x1FFFFF00")] {
+    for (mask, expect) in [
+        (0xFFu64, "0xFF"),
+        (0xFF00, "0xFF00"),
+        (0x1FFF_FF00, "0x1FFFFF00"),
+    ] {
         let out = edit(
             toml,
             json!({
