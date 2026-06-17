@@ -49,8 +49,13 @@ stringified for display or an entity state.
 - **DBC** — import a Vector `.dbc` to catalogue TOML and export back
   (`dbc::convert_dbc_to_toml`, `dbc::render_catalog_as_dbc_with_mode`), including
   extended (`SG_MUL_VAL_`) and flattened multiplex modes.
-- **Edit** — toggle a Modbus frame's `disabled` flag in place via `toml_edit`,
-  preserving comments and formatting.
+- **Edit** — comment-/formatting-preserving in-place edits via `toml_edit`
+  (`edit::apply_edit`): set a table, upsert a frame/signal in sorted position,
+  rename a key, delete — only the targeted entry changes, every `#` comment survives.
+- **Migrate** — `migrate::migrate` upgrades a catalogue's *text* to the current
+  schema (comment-preserving, idempotent): synthesise a slave node from a legacy
+  `[meta.modbus].device_address` (registers get `node_address`), and flatten a
+  frame's `[tx]` interval to the top-level `interval_ms`.
 
 ```toml
 [meta]
@@ -64,10 +69,11 @@ default_word_order = "little"
 device_address = 1
 
 [frame.modbus.battery_status]   # one Modbus read of a register block
-node = "Slave 1"                # which slave this register is read from
+node_address = 1                # the slave to read from (matched to a node by address)
 register_number = 13019
 register_type = "input"         # input | holding | coil | discrete
 length = 9                      # register count
+interval_ms = 5000              # poll interval (ms); legacy [tx] table also accepted
 
 [[frame.modbus.battery_status.signals]]   # a bit-slice of the block
 name = "Battery_SoC"
@@ -80,13 +86,14 @@ unit = "%"
 ### Modbus slaves (nodes)
 
 - **The slave owns the device address** — declare each slave as `[node.<name>]`
-  with a `device_address`, and point a register at it with `node = "<name>"`.
-  One catalogue can describe several slaves, each polled at its own address.
+  with a `device_address`, and point a register at it with `node_address = <N>`
+  (matched to the node by its address). One catalogue can describe several slaves,
+  each polled at its own address; renaming a node never breaks a register reference.
 - **Legacy fallback + migration** — an older catalogue that set
   `[meta.modbus].device_address` and declared no nodes still parses: every
   register resolves that address, and a slave node is synthesised from it (with
   the orphaned registers attached) so the editor shows them grouped. A register
-  with no `node` falls back to the legacy address, else `1`.
+  with no `node_address` falls back to the legacy address, else `1`.
 
 ### Modbus shorthands
 
@@ -96,6 +103,9 @@ unit = "%"
 - **Signal-less register** — a register that *is* a single value needs no
   `[[signals]]` block; put the decoding fields at the frame level and one
   full-width signal (`length × 16` bits) is synthesised.
+- **Poll interval** — a register's cadence is the top-level `interval_ms` (the
+  legacy `[tx]` table — `tx.interval_ms` / `tx.interval` — is still read), else
+  `[meta.modbus].default_interval`, else 5000 ms.
 
 ## Versioning
 
