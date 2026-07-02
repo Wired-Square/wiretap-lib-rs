@@ -134,6 +134,7 @@ fn normalise_signal(raw: &Value, inherited: bool) -> Signal {
         enum_map: parse_enum_map(get(raw, "enum")),
         confidence: as_str(raw, "confidence").and_then(parse_confidence),
         inherited: inherited || as_bool(raw, "_inherited").unwrap_or(false),
+        notes: parse_notes(raw),
         ..Default::default()
     }
 }

@@ -128,6 +128,9 @@ pub struct Signal {
     pub enum_map: Option<BTreeMap<i64, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<Confidence>,
+    /// Free-text notes on the signal (`notes` — a string or array in TOML).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     /// True when this signal was inherited from a mirror/copy source rather
     /// than defined directly on the frame.
     #[serde(default, skip_serializing_if = "is_false")]
