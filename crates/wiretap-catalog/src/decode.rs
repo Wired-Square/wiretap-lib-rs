@@ -301,12 +301,17 @@ pub fn decode_by_id(catalog: &Catalog, raw_frame_id: u32, bytes: &[u8]) -> Optio
 /// catalogue keyed by message-type-only (e.g. J1939 PGN) matches frames that
 /// carry extra id bits. Mirrors `decoderStore`'s `maskedFrameId`.
 fn masked_frame_id(catalog: &Catalog, raw: u32) -> u32 {
-    let mask = match catalog.protocol {
+    frame_id_mask(catalog).map(|m| raw & m).unwrap_or(raw)
+}
+
+/// The protocol's `frame_id_mask`, if it declares one. Exposed so a caller that
+/// masks ids repeatedly can read it once rather than re-deriving per frame.
+pub fn frame_id_mask(catalog: &Catalog) -> Option<u32> {
+    match catalog.protocol {
         Protocol::Can => catalog.can.as_ref().and_then(|c| c.frame_id_mask),
         Protocol::Serial => catalog.serial.as_ref().and_then(|c| c.frame_id_mask),
         Protocol::Modbus => None,
-    };
-    mask.map(|m| raw & m).unwrap_or(raw)
+    }
 }
 
 /// Extract header fields into `out` — CAN from the raw id (mask + shift), serial

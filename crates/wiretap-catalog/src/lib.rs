@@ -7,6 +7,8 @@
 //! - [`validate`] — field-path + message findings for the editor.
 //! - [`decode`] — raw bytes → signal values (the single decode implementation;
 //!   [`modbus`] shares its bit-extraction core).
+//! - [`mirror`] — live `mirror_of` validation: does a mirrored frame still agree
+//!   with its source, over the bytes it inherited?
 //! - [`modbus`] — the Modbus register-poll/encode model and shorthands.
 //! - [`dbc`] — Vector DBC ↔ catalogue TOML import/export.
 //!
@@ -18,11 +20,13 @@ pub mod dbc;
 pub mod decode;
 pub mod edit;
 pub mod migrate;
+pub mod mirror;
 pub mod modbus;
 pub mod model;
 pub mod parse;
 pub mod validate;
 
+pub use mirror::{MirrorTracker, MirrorVerdict};
 pub use model::{
     CanConfig, Catalog, ChecksumConfig, Confidence, Endianness, Frame, HeaderField, Meta,
     ModbusConfig, Mux, MuxCase, Protocol, RegisterType, SerialConfig, Signal, SignalFormat,
