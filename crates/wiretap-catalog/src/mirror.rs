@@ -488,6 +488,149 @@ mirror_of = "0x708"
         );
     }
 
+    /// Real `0x005`/`0x705` traffic from a Sungrow SBR224 (WT Bendigo,
+    /// 2026-07-31 05:00Z, a window where the pack sat at 100 % SoC). Byte 1 is
+    /// the end-stop flag: `01` on the `0x0NN` copy, `00` on `0x7NN`. Byte 5
+    /// drifts as the pack voltage moves, but both copies agree at each instant.
+    /// Frames arrive `0x005` first, `0x705` ~16 ms behind.
+    const REAL_PAIRS: &[(bool, f64, [u8; 8])] = &[
+        (
+            true,
+            0.000,
+            [0x02, 0x01, 0x01, 0xeb, 0x20, 0x0d, 0x13, 0x00],
+        ),
+        (
+            false,
+            0.016,
+            [0x02, 0x00, 0x01, 0xeb, 0x20, 0x0d, 0x13, 0x00],
+        ),
+        (
+            true,
+            1.000,
+            [0x02, 0x01, 0x01, 0xeb, 0x20, 0x0c, 0x13, 0x00],
+        ),
+        (
+            false,
+            1.015,
+            [0x02, 0x00, 0x01, 0xeb, 0x20, 0x0c, 0x13, 0x00],
+        ),
+        (
+            true,
+            2.029,
+            [0x02, 0x01, 0x01, 0xeb, 0x20, 0x0c, 0x13, 0x00],
+        ),
+        (
+            false,
+            2.053,
+            [0x02, 0x00, 0x01, 0xeb, 0x20, 0x0c, 0x13, 0x00],
+        ),
+        (
+            true,
+            3.018,
+            [0x02, 0x01, 0x01, 0xeb, 0x20, 0x0b, 0x13, 0x00],
+        ),
+        (
+            false,
+            3.031,
+            [0x02, 0x00, 0x01, 0xeb, 0x20, 0x0b, 0x13, 0x00],
+        ),
+        (
+            true,
+            4.018,
+            [0x02, 0x01, 0x01, 0xeb, 0x20, 0x0b, 0x13, 0x00],
+        ),
+        (
+            false,
+            4.032,
+            [0x02, 0x00, 0x01, 0xeb, 0x20, 0x0b, 0x13, 0x00],
+        ),
+    ];
+
+    fn sbr_catalogue(with_override: bool) -> Catalog {
+        let mut toml = String::from(
+            r#"
+[meta]
+name = "sbr"
+
+[frame.can."0x705"]
+length = 8
+
+[[frame.can."0x705".signals]]
+name = "Info_Battery_Operation"
+start_bit = 0
+bit_length = 8
+
+[[frame.can."0x705".signals]]
+name = "705_End_Stop"
+start_bit = 8
+bit_length = 8
+
+[[frame.can."0x705".signals]]
+name = "705_Always_1"
+start_bit = 16
+bit_length = 8
+
+[[frame.can."0x705".signals]]
+name = "Info_Battery_Type"
+start_bit = 24
+bit_length = 16
+
+[[frame.can."0x705".signals]]
+name = "Status_Battery_Voltage_Alt_705"
+start_bit = 40
+bit_length = 16
+
+[[frame.can."0x705".signals]]
+name = "705_Padding"
+start_bit = 56
+bit_length = 8
+
+[frame.can."0x005"]
+length = 8
+mirror_of = "0x705"
+"#,
+        );
+        if with_override {
+            toml.push_str(
+                r#"
+[[frame.can."0x005".signals]]
+name = "Status_Battery_End_Stop"
+start_bit = 8
+bit_length = 8
+"#,
+            );
+        }
+        parse(&toml)
+    }
+
+    fn run_real_pairs(cat: &Catalog) -> MirrorVerdict {
+        let mut tracker = MirrorTracker::new(cat);
+        for (is_mirror, t, bytes) in REAL_PAIRS {
+            tracker.observe(if *is_mirror { 0x005 } else { 0x705 }, bytes, *t);
+        }
+        verdict(&tracker, 0x005).expect("0x005 is a tracked mirror")
+    }
+
+    /// The regression this module exists for: on real SBR traffic the `0x005`
+    /// copy carries a live end-stop flag in a byte its source holds at zero.
+    /// Declaring it locally is what tells the comparison to leave that byte
+    /// alone — without it the frame reads as a fault roughly a quarter of the
+    /// time, which is exactly what was reported from the field.
+    #[test]
+    fn real_sbr_traffic_matches_only_because_byte_1_is_overridden() {
+        let with = run_real_pairs(&sbr_catalogue(true));
+        assert_eq!(with.is_valid, Some(true), "the override must hold Match");
+        assert!(with.mismatched_byte_indices.is_empty());
+
+        let without = run_real_pairs(&sbr_catalogue(false));
+        assert_eq!(
+            without.is_valid,
+            Some(false),
+            "without the override the same bytes must latch Mismatch"
+        );
+        assert_eq!(without.mismatched_byte_indices, vec![1]);
+    }
+
     #[test]
     fn a_frame_that_is_not_a_mirror_has_no_verdict() {
         let cat = parse(OVERRIDE_TOML);
