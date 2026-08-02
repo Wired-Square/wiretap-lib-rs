@@ -111,6 +111,111 @@ pub enum EditOp {
     },
 }
 
+/// The outcome of [`bump_meta_version`]: the new text, and the pair of numbers so a
+/// caller can say "3 → 4" without parsing either side again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionBump {
+    pub text: String,
+    pub from: u32,
+    pub to: u32,
+}
+
+/// Increment `[meta].version`, changing nothing else in the file.
+///
+/// **Deliberately not an [`EditOp`].** Every op goes through [`DocumentMut`], and a
+/// `DocumentMut` round-trip is not byte-preserving in three ways that matter here:
+///
+/// * `Table::insert` re-formats the key it replaces, and the parser folds the comment
+///   lines *above* a key into that key's own decor — so a comment block above
+///   `version` is deleted;
+/// * a trailing `# note` on the version line lives in the value's suffix decor and is
+///   replaced along with the value;
+/// * the encoder re-emits every key-value with `writeln!`, so a CRLF document comes
+///   back LF throughout.
+///
+/// The publish path hashes *exact bytes* to decide what is in sync, so any of the
+/// three would turn a one-line bump into a whole-file diff. Splicing over the
+/// integer's own span leaves the rest of the document untouched by construction
+/// rather than by inspection — which is what the tests assert.
+///
+/// `Err` when there is no `[meta]`, when `version` is not an integer, or on overflow.
+/// Callers treat that as "no bump": this is a convenience, and it must never fail the
+/// operation it is decorating.
+pub fn bump_meta_version(text: &str) -> Result<VersionBump, String> {
+    // `ImDocument` keeps spans; `DocumentMut` discards them (it calls `despan`), and
+    // the span is the whole point.
+    let doc = toml_edit::ImDocument::parse(text)
+        .map_err(|e| format!("catalogue is not valid TOML: {e}"))?;
+    let meta = doc
+        .as_table()
+        .get("meta")
+        .and_then(Item::as_table)
+        .ok_or_else(|| "catalogue has no [meta] section".to_string())?;
+
+    let Some(item) = meta.get("version") else {
+        // Absent and `= 1` are the same claim — `Meta::version` defaults to 1 — so the
+        // honest increment is 2. Refusing would silently do nothing for a valid file
+        // whose author never wrote the key, having just been asked to bump it.
+        return insert_meta_version(text, meta, 2);
+    };
+    let value = item
+        .as_value()
+        .and_then(Value::as_integer)
+        .ok_or_else(|| "[meta].version is not an integer".to_string())?;
+    let from = u32::try_from(value).map_err(|_| "[meta].version is out of range".to_string())?;
+    let to = from
+        .checked_add(1)
+        .ok_or_else(|| "[meta].version is at its maximum".to_string())?;
+    let span = item
+        .span()
+        .ok_or_else(|| "[meta].version has no source span".to_string())?;
+
+    Ok(VersionBump {
+        text: format!("{}{to}{}", &text[..span.start], &text[span.end..]),
+        from,
+        to,
+    })
+}
+
+/// Write a `version` key into an existing `[meta]` that lacks one, on its own line
+/// after `name` (or at the top of the table when there is no `name` either).
+///
+/// Splices at a line boundary for the same reason [`bump_meta_version`] splices at a
+/// value span: anything that rebuilds the table rewrites the whole document.
+fn insert_meta_version(text: &str, meta: &Table, to: u32) -> Result<VersionBump, String> {
+    // After `name` keeps the two identity keys together, which is how every catalogue
+    // in the wild is laid out; the table header is the fallback.
+    let anchor = meta
+        .get("name")
+        .and_then(Item::span)
+        .or_else(|| meta.span())
+        .ok_or_else(|| "[meta] has no source span".to_string())?;
+    let line_end = text[anchor.end..]
+        .find('\n')
+        .map(|i| anchor.end + i)
+        .unwrap_or(text.len());
+    // Match the document's own line ending, so a CRLF file stays CRLF here too.
+    let newline = if text[..line_end].ends_with('\r') {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let insert_at = if newline == "\r\n" {
+        line_end - 1
+    } else {
+        line_end
+    };
+    Ok(VersionBump {
+        text: format!(
+            "{}{newline}version = {to}{}",
+            &text[..insert_at],
+            &text[insert_at..]
+        ),
+        from: 1,
+        to,
+    })
+}
+
 /// Apply one edit to the raw catalogue TOML, preserving comments and formatting.
 /// `Err` carries a UI-friendly message (invalid TOML, missing target, rename
 /// collision); the caller shows it and leaves the document untouched.

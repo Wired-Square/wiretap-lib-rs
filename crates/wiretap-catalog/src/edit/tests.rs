@@ -415,3 +415,91 @@ fn invalid_toml_errors() {
     );
     assert!(res.is_err());
 }
+
+// ── bump_meta_version ────────────────────────────────────────────────────────
+//
+// These assert **whole documents**, not `contains`. The bump exists on the publish
+// path, which hashes exact bytes, so "the version changed and nothing else did" is
+// the entire contract — and `contains` is precisely what would let a decor or
+// line-ending regression through.
+
+/// The test the `EditOp::SetTable` approach fails. A `DocumentMut` round-trip deletes
+/// the comment block above `version` (the parser folds it into that key's decor, and
+/// `Table::insert` re-formats the key) and the trailing note (value suffix decor).
+#[test]
+fn bump_preserves_every_other_byte() {
+    let text = "\
+# Sungrow SHx inverter, reverse-engineered from a live SH10RT.
+[meta]
+name = \"Sungrow SHx\"
+
+# Bumped when the mux map was corrected.
+version = 3  # keep in step with the wiki page
+
+[meta.can]
+bitrate = 500000
+
+[frame.can.0x100]
+name = \"Status\"
+";
+    let bumped = bump_meta_version(text).expect("bumps");
+    assert_eq!(bumped.from, 3);
+    assert_eq!(bumped.to, 4);
+    assert_eq!(bumped.text, text.replace("version = 3", "version = 4"));
+}
+
+/// Fails loudly if anyone "simplifies" this back to a `DocumentMut` round-trip, whose
+/// encoder re-emits every key-value with a bare `\n`.
+#[test]
+fn bump_preserves_crlf() {
+    let text = "[meta]\r\nname = \"X\"\r\nversion = 9\r\n\r\n[meta.can]\r\nbitrate = 250000\r\n";
+    let bumped = bump_meta_version(text).expect("bumps");
+    assert_eq!(bumped.text, text.replace("version = 9", "version = 10"));
+    assert!(bumped.text.contains("\r\n"), "line endings survive");
+}
+
+/// Absent and `= 1` are the same claim, so the honest increment is 2. Asserts the
+/// placement as well as the value — it must land inside `[meta]`, after `name`, and
+/// before the sub-tables.
+#[test]
+fn bump_writes_version_two_when_the_key_is_absent() {
+    let text = "[meta]\nname = \"X\"\n\n[meta.can]\nbitrate = 500000\n";
+    let bumped = bump_meta_version(text).expect("bumps");
+    assert_eq!((bumped.from, bumped.to), (1, 2));
+    assert_eq!(
+        bumped.text,
+        "[meta]\nname = \"X\"\nversion = 2\n\n[meta.can]\nbitrate = 500000\n"
+    );
+}
+
+#[test]
+fn bump_inserts_with_the_documents_own_line_ending() {
+    let text = "[meta]\r\nname = \"X\"\r\n";
+    let bumped = bump_meta_version(text).expect("bumps");
+    assert_eq!(bumped.text, "[meta]\r\nname = \"X\"\r\nversion = 2\r\n");
+}
+
+#[test]
+fn bump_refuses_a_non_integer_version() {
+    assert!(bump_meta_version("[meta]\nname = \"X\"\nversion = \"3\"\n").is_err());
+}
+
+#[test]
+fn bump_refuses_at_the_maximum() {
+    let text = format!("[meta]\nname = \"X\"\nversion = {}\n", u32::MAX);
+    assert!(bump_meta_version(&text).is_err());
+}
+
+#[test]
+fn bump_refuses_without_a_meta_section() {
+    assert!(bump_meta_version("[frame.can.0x100]\nname = \"X\"\n").is_err());
+}
+
+/// The bumped text must still parse, and to the number we claimed.
+#[test]
+fn bump_round_trips_through_the_parser() {
+    let text = "[meta]\nname = \"X\"\nversion = 7\n";
+    let bumped = bump_meta_version(text).expect("bumps");
+    let catalog = crate::model::Catalog::parse(&bumped.text).expect("parses");
+    assert_eq!(catalog.meta.version, bumped.to);
+}
