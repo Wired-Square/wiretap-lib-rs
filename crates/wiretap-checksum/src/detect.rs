@@ -487,6 +487,60 @@ fn explain_no_candidates(last: &ChecksumColumnStat, frame_count: usize) -> Check
     }
 }
 
+/// Report constant tail columns as runs rather than one note each.
+///
+/// An all-zero frame profiles four constant columns and produced four lines
+/// saying the same thing in different words. Only columns sharing a value join a
+/// run — `0x00` beside `0xFF` is two facts, not one.
+fn constant_padding_notes(columns: &[ChecksumColumnStat]) -> Vec<ChecksumNote> {
+    let padding: Vec<&ChecksumColumnStat> = columns
+        .iter()
+        .filter(|c| c.sample_count >= CONSTANT_COLUMN_MIN_SAMPLES)
+        .collect();
+
+    let mut notes = Vec::new();
+    let mut index = 0;
+
+    while index < padding.len() {
+        let Some(value) = padding[index].constant_value else {
+            index += 1;
+            continue;
+        };
+
+        // Columns arrive -1, -2, -3…, so a run is contiguous in this order.
+        let start = index;
+        while index + 1 < padding.len()
+            && padding[index + 1].constant_value == Some(value)
+            && padding[index + 1].position == padding[index].position - 1
+        {
+            index += 1;
+        }
+
+        let hex = format!("0x{value:02X}");
+        notes.push(if index > start {
+            ChecksumNote::new(
+                "constantPaddingRun",
+                &[
+                    ("from", padding[index].position.into()),
+                    ("to", padding[start].position.into()),
+                    ("value", hex.into()),
+                ],
+            )
+        } else {
+            ChecksumNote::new(
+                "constantPadding",
+                &[
+                    ("position", padding[start].position.into()),
+                    ("value", hex.into()),
+                ],
+            )
+        });
+        index += 1;
+    }
+
+    notes
+}
+
 /// Find the checksum configurations that best explain a set of frames.
 pub fn detect_checksum(
     frames: &[Vec<u8>],
@@ -522,19 +576,7 @@ pub fn detect_checksum(
             ("maxLength", max_length.into()),
         ],
     )];
-    for column in &tail_columns {
-        if let Some(value) = column.constant_value {
-            if column.sample_count >= CONSTANT_COLUMN_MIN_SAMPLES {
-                notes.push(ChecksumNote::new(
-                    "constantPadding",
-                    &[
-                        ("position", column.position.into()),
-                        ("value", format!("0x{value:02X}").into()),
-                    ],
-                ));
-            }
-        }
-    }
+    notes.extend(constant_padding_notes(&tail_columns));
 
     let specs = build_checksum_specs(&samples, options, &tail_columns);
     let results = sweep_specs(&samples, &specs);
@@ -583,6 +625,7 @@ mod tests {
     use crate::testing::{
         many_real_frames, modbus_frames, real_serial_frames, real_serial_frames_with_acks,
     };
+    use serde_json::json;
 
     /// Default profiling depth, matching what `detect_checksum` uses for the
     /// default positions.
@@ -631,8 +674,10 @@ mod tests {
         assert_eq!(best.total_count, 72);
     }
 
+    /// Adjacent constant columns sharing a value are one fact, not four. The
+    /// fixture pads bytes -4 through -2 with zeros, so that is one note.
     #[test]
-    fn test_detect_reports_the_constant_padding_byte() {
+    fn test_detect_reports_constant_padding_as_a_single_run() {
         let result = detect_checksum(&many_real_frames(), &Default::default());
 
         let minus_two = result
@@ -641,7 +686,55 @@ mod tests {
             .find(|c| c.position == -2)
             .unwrap();
         assert_eq!(minus_two.constant_value, Some(0x00));
-        assert!(note_codes(&result.notes).contains(&"constantPadding"));
+
+        let padding: Vec<&ChecksumNote> = result
+            .notes
+            .iter()
+            .filter(|n| n.code.starts_with("constantPadding"))
+            .collect();
+
+        assert_eq!(padding.len(), 1, "{padding:?}");
+        assert_eq!(padding[0].code, "constantPaddingRun");
+        assert_eq!(padding[0].values["from"], json!(-4));
+        assert_eq!(padding[0].values["to"], json!(-2));
+    }
+
+    /// A lone constant column still reads as one, not as a run of one.
+    #[test]
+    fn test_detect_reports_a_single_constant_column_without_a_range() {
+        // Byte -2 is constant; -1 and -3 vary, so it cannot join a run.
+        let frames: Vec<Vec<u8>> = (0..40u32)
+            .map(|i| vec![0x10, (i * 7) as u8, (i * 13) as u8, 0xAA, (i * 3) as u8])
+            .collect();
+        let result = detect_checksum(&frames, &Default::default());
+
+        let padding: Vec<&ChecksumNote> = result
+            .notes
+            .iter()
+            .filter(|n| n.code.starts_with("constantPadding"))
+            .collect();
+
+        assert_eq!(padding.len(), 1, "{padding:?}");
+        assert_eq!(padding[0].code, "constantPadding");
+        assert_eq!(padding[0].values["position"], json!(-2));
+    }
+
+    /// Different constants are different facts, so they must not merge.
+    #[test]
+    fn test_detect_does_not_merge_constant_columns_of_different_values() {
+        let frames: Vec<Vec<u8>> = (0..40u32)
+            .map(|i| vec![0x10, (i * 7) as u8, 0xFF, 0x00, (i * 3) as u8])
+            .collect();
+        let result = detect_checksum(&frames, &Default::default());
+
+        let padding: Vec<&ChecksumNote> = result
+            .notes
+            .iter()
+            .filter(|n| n.code.starts_with("constantPadding"))
+            .collect();
+
+        assert_eq!(padding.len(), 2, "{padding:?}");
+        assert!(padding.iter().all(|n| n.code == "constantPadding"));
     }
 
     #[test]

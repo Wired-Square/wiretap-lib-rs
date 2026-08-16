@@ -69,6 +69,10 @@ pub const ALL_NOTES: &[NoteSpec] = &[
         values: &["position", "value"],
     },
     NoteSpec {
+        code: "constantPaddingRun",
+        values: &["from", "to", "value"],
+    },
+    NoteSpec {
         code: "fewSamples",
         values: &["count"],
     },
