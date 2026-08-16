@@ -8,7 +8,8 @@
 //!   grouped sweep that measures many specs against many frames.
 //! - [`detect`] — the engine: build the candidate space from column priors,
 //!   sweep it, score and rank what survives, and explain the verdict.
-//! - [`notes`] — the translatable note type every explanation crosses as.
+//! - [`notes`] — the translatable note type every explanation crosses as, and
+//!   [`ALL_NOTES`], the manifest a consumer pins its locale file against.
 //!
 //! Offsets are end-relative throughout (a negative index counts from the end),
 //! because that is the only way frames of different lengths on one link line up.
@@ -39,7 +40,7 @@ pub use frame::{
     calculate_checksum, extract_checksum, resolve_byte_index, validate_checksum,
     ChecksumValidationResult,
 };
-pub use notes::ChecksumNote;
+pub use notes::{ChecksumNote, NoteSpec, ALL_NOTES};
 pub use sampling::{deduplicate, diverse_samples};
 pub use solve::{
     solve_additive, solve_crc, AdditiveOp, CrcAlternative, CrcParameters, CrcSolveOptions,
