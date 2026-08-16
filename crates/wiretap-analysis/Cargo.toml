@@ -1,0 +1,12 @@
+[package]
+name = "wiretap-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Payload analysis for WireTAP frames: per-column statistics and the identification pass that says which bytes are worth solving as a checksum."
+readme = "README.md"
+
+[dependencies]
+wiretap-checksum = { path = "../wiretap-checksum" }
+serde = { version = "1", features = ["derive"] }

@@ -11,10 +11,12 @@ A Cargo workspace of related **WireTAP** Rust libraries. Each crate lives under
 | [`wiretap-catalog`](crates/wiretap-catalog) | Parser, validator, decoder, and writer for WireTAP-format device catalogues (TOML) across CAN, Serial, and Modbus. |
 | [`wiretap-decode`](crates/wiretap-decode) | Protocol-agnostic decode core — bit extraction, 16-bit word-swap, exact `Decimal` scaling, and value formatting. `wiretap-catalog` builds on it; it has no dependency on the catalogue model. |
 | [`wiretap-checksum`](crates/wiretap-checksum) | Checksum algorithms (XOR, Sum8, CRC-8/16) and the engine that works out which one a link is using — a scored sweep of the named algorithms, plus solvers that recover an arbitrary CRC polynomial or an offset sum outright. |
+| [`wiretap-analysis`](crates/wiretap-analysis) | Payload analysis: per-byte-column statistics, and the identification pass that decides which bytes are worth solving as a checksum at all. Builds on `wiretap-checksum`. |
 
-`wiretap-catalog` is the top of the stack; the other two are its primitives and
-have no dependency on the catalogue model. Read a crate's own README for what it
-does and why it does it that way.
+`wiretap-catalog` is the top of the stack; `wiretap-decode` and
+`wiretap-checksum` are primitives with no dependency on the catalogue model, and
+`wiretap-analysis` sits on top of `wiretap-checksum`. Read a crate's own README
+for what it does and why it does it that way.
 
 ## Develop
 
