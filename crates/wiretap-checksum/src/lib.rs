@@ -19,6 +19,8 @@ pub mod algorithms;
 pub mod detect;
 pub mod frame;
 pub mod notes;
+pub mod sampling;
+pub mod solve;
 pub mod spec;
 
 #[cfg(test)]
@@ -38,4 +40,9 @@ pub use frame::{
     ChecksumValidationResult,
 };
 pub use notes::ChecksumNote;
+pub use sampling::{deduplicate, diverse_samples};
+pub use solve::{
+    solve_additive, solve_crc, AdditiveOp, CrcAlternative, CrcParameters, CrcSolveOptions,
+    SolveTarget, SolvedChecksum, SolvedKind,
+};
 pub use spec::{sweep_specs, ChecksumSpec, ChecksumSpecResult};
