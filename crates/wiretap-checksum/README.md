@@ -22,7 +22,8 @@ does.
   priors, scores each survivor on match rate, sample count, column variance and
   range plausibility, then ranks and folds equivalent ranges together
 - **solving** — `solve_additive` and `solve_crc` for when the answer is not one
-  of the eleven
+  of the eleven, and `solve_all`, which folds the duplicates the range space
+  produces so a caller cannot forget to
 - **sampling** — `diverse_samples`, because a periodic link hands a solver a
   hundred copies of one payload unless you ask for better
 
@@ -71,12 +72,18 @@ Tesla HPWC sum does — could be *matched* and never *solved*, and ticking
 turn. A solve is microseconds; there was never a cost reason for the narrower
 space, only an accident of where the constant lived.
 
-The flip side is that widening it makes duplicates, and a caller must fold them.
-A constant range contributes a constant, which a sum absorbs into its offset and
-a CRC into its residue — so when the excluded bytes never change, *every* start
-solves, with a different offset each. Those are one answer written several ways.
-Report the widest and carry the rest as equivalents; when only one range solves,
+The flip side is that widening it makes duplicates. A constant range contributes
+a constant, which a sum absorbs into its offset and a CRC into its residue — so
+when the excluded bytes never change, *every* start solves, with a different
+offset each. Those are one answer written several ways. `solve_all` reports the
+widest and carries the rest as `equivalent_ranges`; when only one range solves,
 the excluded bytes did move, and that answer is the real one.
+
+The fold lives here rather than in the caller because this crate is what
+produces the duplicates. Leaving it to a doc comment is how the second consumer
+ends up without it — `ChecksumSpecification::family()` keys the fold from an
+exhaustive match, so a new checksum family is a compile error rather than a
+silent stop folding.
 
 Explanations cross as `ChecksumNote { code, values }` rather than English, so
 the caller translates.

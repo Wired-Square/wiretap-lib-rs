@@ -9,4 +9,5 @@ readme = "README.md"
 
 [dependencies]
 wiretap-checksum = { path = "../wiretap-checksum" }
+rayon = "1"
 serde = { version = "1", features = ["derive"] }

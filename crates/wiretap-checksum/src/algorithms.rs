@@ -56,7 +56,8 @@ impl ChecksumAlgorithm {
         }
     }
 
-    /// The catalogue's algorithm id (`validate.rs`'s `CHECKSUM_ALGORITHMS`).
+    /// The catalogue's algorithm id. See [`crate::all_algorithm_ids`] for the
+    /// full vocabulary, which adds the two parameterised shapes.
     pub fn as_str(&self) -> &'static str {
         match self {
             ChecksumAlgorithm::Xor => "xor",

@@ -32,7 +32,7 @@
 
 use serde::Serialize;
 use wiretap_checksum::columns::{analyse_columns, ColumnStats};
-use wiretap_checksum::{calc_ranges, SolveTarget, MAX_SAMPLES};
+use wiretap_checksum::{calc_ranges, strided_samples, SolveTarget, MAX_SAMPLES};
 
 /// Below this many payload pairs, the conditional rates are noise.
 const MIN_TRANSITIONS: usize = 8;
@@ -208,12 +208,9 @@ fn evaluate(
 /// Returned in column order (-1 first), rejections included, so a caller can
 /// report what it decided about each byte rather than only what survived.
 pub fn checksum_evidence(payloads: &[Vec<u8>]) -> Vec<ChecksumEvidence> {
-    let sample: Vec<Vec<u8>> = payloads
-        .iter()
-        .filter(|p| !p.is_empty())
-        .take(MAX_SAMPLES)
-        .cloned()
-        .collect();
+    // Strided, not truncated: handed a whole capture, a prefix would judge every
+    // column on its first seconds. `strided_samples` owns that rule.
+    let sample = strided_samples(payloads, MAX_SAMPLES);
     let columns = analyse_columns(&sample);
     checksum_evidence_with_columns(&sample, &columns)
 }
@@ -243,6 +240,18 @@ pub fn checksum_evidence_with_columns(
         .collect()
 }
 
+/// A geometry to solve, with the identification score that justified it.
+///
+/// The score travels with the target because the pass that chose it had the
+/// score in hand; making the caller search the columns again to recover it
+/// rebuilds the two-byte keying rule at the wrong end.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RankedTarget {
+    pub target: SolveTarget,
+    /// 0-100, across the bytes the checksum occupies.
+    pub likeness: u8,
+}
+
 /// The geometries worth handing to the solver, best first.
 ///
 /// One target per surviving column, plus the two-byte target that column would
@@ -255,7 +264,7 @@ pub fn solve_targets(
     evidence: &[ChecksumEvidence],
     columns: &[ColumnStats],
     min_likeness: u8,
-) -> Vec<SolveTarget> {
+) -> Vec<RankedTarget> {
     let mut ranked: Vec<&ChecksumEvidence> = evidence
         .iter()
         .filter(|e| e.is_candidate() && e.likeness >= min_likeness)
@@ -285,14 +294,27 @@ pub fn solve_targets(
                 &[true]
             };
 
+            // The likeness that justified this target, taken across the bytes
+            // it actually covers — a two-byte target is keyed on the lower of
+            // the pair. Carried with the target because the caller would
+            // otherwise search the columns again to recover it.
+            let likeness = (0..byte_length as i32)
+                .filter_map(|offset| evidence.iter().find(|e| e.position == position + offset))
+                .map(|e| e.likeness)
+                .max()
+                .unwrap_or(0);
+
             for range in calc_ranges(position, columns, &[]) {
                 for &big_endian in endiannesses {
-                    targets.push(SolveTarget {
-                        position,
-                        byte_length,
-                        big_endian,
-                        calc_start_byte: range.calc_start_byte,
-                        calc_end_byte: range.calc_end_byte,
+                    targets.push(RankedTarget {
+                        target: SolveTarget {
+                            position,
+                            byte_length,
+                            big_endian,
+                            calc_start_byte: range.calc_start_byte,
+                            calc_end_byte: range.calc_end_byte,
+                        },
+                        likeness,
                     });
                 }
             }
@@ -317,6 +339,9 @@ mod tests {
         let columns = analyse_columns(payloads);
         let evidence = checksum_evidence_with_columns(payloads, &columns);
         solve_targets(&evidence, &columns, min_likeness)
+            .into_iter()
+            .map(|r| r.target)
+            .collect()
     }
 
     /// Independently varying data with a real checksum appended.

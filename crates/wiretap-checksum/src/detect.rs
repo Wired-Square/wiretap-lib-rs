@@ -14,6 +14,7 @@ use crate::algorithms::{ChecksumAlgorithm, ALL_ALGORITHMS};
 use crate::columns::{analyse_columns, ColumnStats};
 use crate::frame::resolve_byte_index;
 use crate::notes::ChecksumNote;
+use crate::sampling::strided_samples;
 use crate::spec::{sweep_specs, ChecksumSpec};
 
 /// How many end-relative byte columns the result reports on, at minimum.
@@ -24,6 +25,22 @@ const MIN_TAIL_DEPTH: i32 = 4;
 
 /// Cap on the returned candidate list.
 const MAX_CANDIDATES: usize = 12;
+
+/// Confidence below which a candidate is not worth reporting.
+///
+/// Exported because the solver's scorer applies the same floor, and the two rank
+/// into one list — the same reason [`volume_bonus`] is public. It was the
+/// `Default` here and a private const in the scan, which is one number spelled
+/// twice.
+pub const MIN_CONFIDENCE: u8 = 35;
+
+/// The match rate at which a swept candidate stops being a coincidence.
+///
+/// A checksum that reproduces 94% of a capture is not a low-scoring checksum, it
+/// is the wrong answer. The whole-capture scan filters here; the serial dialog
+/// deliberately keeps a lower default so a hand-driven search can see near
+/// misses.
+pub const STRONG_MATCH_RATE: f64 = 95.0;
 
 /// Frames sampled for detection. The dialog reads the same number from the
 /// capture, so both halves measure against one set.
@@ -53,7 +70,7 @@ impl Default for ChecksumDetectionOptions {
             lengths: Vec::new(),
             header_boundaries: Vec::new(),
             min_match_rate: 50.0,
-            min_confidence: 35,
+            min_confidence: MIN_CONFIDENCE,
         }
     }
 }
@@ -237,6 +254,24 @@ pub fn build_checksum_specs(
     specs
 }
 
+/// How much a candidate's score gains from the weight of evidence behind it.
+///
+/// Both scorers use it — the sweep here, and the solver's upstream, which ranks
+/// into the same list. The tiers were written out twice, so retuning one
+/// silently reweighted the other's position in a list they share.
+///
+/// Zero means too few samples to be worth crediting at all, which is also the
+/// condition the `fewSamples` note reports.
+pub fn volume_bonus(sample_count: usize) -> i32 {
+    match sample_count {
+        n if n >= 200 => 20,
+        n if n >= 50 => 15,
+        n if n >= 20 => 10,
+        n if n >= 8 => 5,
+        _ => 0,
+    }
+}
+
 struct ScoringContext<'a> {
     columns: &'a [ColumnStats],
     header_boundaries: &'a [i32],
@@ -307,15 +342,9 @@ fn score_candidate(
         ));
     }
 
-    if total_count >= 200 {
-        score += 20;
-    } else if total_count >= 50 {
-        score += 15;
-    } else if total_count >= 20 {
-        score += 10;
-    } else if total_count >= 8 {
-        score += 5;
-    } else {
+    let volume = volume_bonus(total_count);
+    score += volume;
+    if volume == 0 {
         notes.push(ChecksumNote::new(
             "fewSamples",
             &[("count", total_count.into())],
@@ -531,12 +560,10 @@ pub fn detect_checksum(
     frames: &[Vec<u8>],
     options: &ChecksumDetectionOptions,
 ) -> ChecksumDetectionResult {
-    let samples: Vec<Vec<u8>> = frames
-        .iter()
-        .filter(|f| !f.is_empty())
-        .take(MAX_SAMPLES)
-        .cloned()
-        .collect();
+    // Strided, not a prefix: handed more than `MAX_SAMPLES` frames, taking the
+    // first of them measures a rate over the start of a capture and reports it
+    // as the whole. `strided_samples` owns that rule for every caller.
+    let samples = strided_samples(frames, MAX_SAMPLES);
     let columns = analyse_columns(&samples);
     detect_checksum_with_columns(&samples, options, &columns)
 }

@@ -22,6 +22,32 @@ pub fn resolve_byte_index(index: i32, frame_length: usize) -> usize {
     }
 }
 
+/// The bytes a checksum is calculated over in *this* frame, or `None` when the
+/// frame is not evidence about the configuration at all.
+///
+/// Two conditions, and both matter. The frame must be long enough to hold the
+/// checksum, and there must be something left to calculate over — a one-byte
+/// acknowledgement sharing a link fits a trailing checksum *exactly*, leaving an
+/// empty range, and counting it as a failure is the bug that has bitten this
+/// engine more than once.
+///
+/// One definition, because the rule had been written out three times: here, in
+/// the sweep, and in the solver's own sample gathering.
+pub fn calculated_range(
+    frame_length: usize,
+    position: i32,
+    byte_length: usize,
+    calc_start_byte: i32,
+    calc_end_byte: i32,
+) -> Option<std::ops::Range<usize>> {
+    if resolve_byte_index(position, frame_length) + byte_length > frame_length {
+        return None;
+    }
+    let start = resolve_byte_index(calc_start_byte, frame_length).min(frame_length);
+    let end = resolve_byte_index(calc_end_byte, frame_length).min(frame_length);
+    (start < end).then_some(start..end)
+}
+
 /// Result of checksum validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChecksumValidationResult {

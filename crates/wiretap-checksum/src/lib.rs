@@ -37,17 +37,19 @@ pub use algorithms::{
 };
 pub use columns::{analyse_columns, ColumnStats};
 pub use detect::{
-    build_checksum_specs, calc_ranges, detect_checksum, detect_checksum_with_columns, CalcRange,
-    ChecksumCandidate, ChecksumDetectionOptions, ChecksumDetectionResult, MAX_SAMPLES,
+    build_checksum_specs, calc_ranges, detect_checksum, detect_checksum_with_columns, volume_bonus,
+    CalcRange, ChecksumCandidate, ChecksumDetectionOptions, ChecksumDetectionResult, MAX_SAMPLES,
+    MIN_CONFIDENCE, STRONG_MATCH_RATE,
 };
 pub use frame::{
-    calculate_checksum, extract_checksum, resolve_byte_index, validate_checksum,
+    calculate_checksum, calculated_range, extract_checksum, resolve_byte_index, validate_checksum,
     ChecksumValidationResult,
 };
 pub use notes::{ChecksumNote, NoteSpec, ALL_NOTES};
-pub use sampling::{deduplicate, diverse_samples};
+pub use sampling::{deduplicate, diverse_samples, strided_samples};
 pub use solve::{
-    solve_additive, solve_crc, AdditiveOp, CrcAlternative, CrcParameters, CrcSolveOptions,
-    SolveTarget, SolvedChecksum, SolvedKind,
+    all_algorithm_ids, solve_additive, solve_all, solve_crc, AdditiveOp, ChecksumSpecification,
+    CrcAlternative, CrcParameters, CrcSolveOptions, SolveTarget, SolvedChecksum, CRC_CUSTOM,
+    SUM8_NEGATED,
 };
 pub use spec::{sweep_specs, ChecksumSpec, ChecksumSpecResult};

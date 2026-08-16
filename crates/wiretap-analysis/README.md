@@ -1,7 +1,16 @@
 # wiretap-analysis
 
 Payload analysis for WireTAP frames: the identification pass that says which
-bytes are worth solving as a checksum, and the geometries to solve them over.
+bytes are worth solving as a checksum, the geometries to solve them over, and
+the scan that drives the whole thing across a capture.
+
+- **identification** — `checksum_evidence`, the per-column verdict
+- **geometry** — `solve_targets`, what to hand
+  [`wiretap-checksum`](../wiretap-checksum)'s solvers
+- **scan** — `scan_frames` / `scan_groups`: group by frame id, sample, identify,
+  sweep, solve, rank. It lives here rather than in an application because all of
+  it is a pure function of payloads, and because the other consumers — a headless
+  agent tool, a catalogue validator — cannot reach into an app binary.
 
 Per-byte-column statistics live in
 [`wiretap-checksum`](../wiretap-checksum), beside the end-relative addressing

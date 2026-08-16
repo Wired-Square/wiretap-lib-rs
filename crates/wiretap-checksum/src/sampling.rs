@@ -30,6 +30,33 @@ fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
     common + (a.len().abs_diff(b.len()) as u32) * 8
 }
 
+/// Up to `limit` payloads spread across the whole set, repeats included.
+///
+/// The counterpart to [`diverse_samples`], and the two exist because the halves
+/// of the engine want opposite things. A sweep measures a *rate* and needs the
+/// population — including its repeats, because "this column never moved in 400
+/// frames" is exactly the claim the constant-column rejection rests on, and
+/// deduplicating first would leave it one sample to judge on. A solver is killed
+/// only by disagreements, so repeats are dead weight to it.
+///
+/// Strided rather than truncated, which is the whole point: taking a prefix
+/// confines the answer to the first seconds of a capture. That was a third,
+/// unnamed policy living inside the identification pass as a `.take()`, where a
+/// caller handing over a raw population got silently that behaviour.
+pub fn strided_samples(frames: &[Vec<u8>], limit: usize) -> Vec<Vec<u8>> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let usable: Vec<&Vec<u8>> = frames.iter().filter(|f| !f.is_empty()).collect();
+    let stride = usable.len().div_ceil(limit).max(1);
+    usable
+        .into_iter()
+        .step_by(stride)
+        .take(limit)
+        .cloned()
+        .collect()
+}
+
 /// Keep one of each distinct payload, in first-seen order.
 pub fn deduplicate(frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
     let mut seen: HashSet<&[u8]> = HashSet::new();
@@ -54,12 +81,7 @@ pub fn diverse_samples(frames: &[Vec<u8>], limit: usize) -> Vec<Vec<u8>> {
 
     // Stride rather than truncate: the deduplicated set is in arrival order, so
     // taking a prefix would confine the pool to the start of the capture.
-    let pool: Vec<Vec<u8>> = if distinct.len() > MAX_POOL {
-        let stride = distinct.len().div_ceil(MAX_POOL);
-        distinct.into_iter().step_by(stride).collect()
-    } else {
-        distinct
-    };
+    let pool = strided_samples(&distinct, MAX_POOL);
 
     let mut chosen = vec![pool[0].clone()];
     // Distance from each pool entry to the nearest already-chosen payload,
@@ -143,6 +165,33 @@ mod tests {
         let frames: Vec<Vec<u8>> = (0..5000u32).map(|i| i.to_le_bytes().to_vec()).collect();
 
         assert_eq!(diverse_samples(&frames, 50).len(), 50);
+    }
+
+    /// The failure the strided policy exists to prevent: a prefix would describe
+    /// the first seconds of a capture and call it the whole thing.
+    #[test]
+    fn test_strided_samples_span_the_whole_set_rather_than_its_start() {
+        let frames: Vec<Vec<u8>> = (0..1000u32).map(|i| i.to_le_bytes().to_vec()).collect();
+        let chosen = strided_samples(&frames, 200);
+
+        assert_eq!(chosen.len(), 200);
+        assert_eq!(chosen[0], 0u32.to_le_bytes().to_vec());
+        // The last pick sits near the end, not at index 199.
+        let last = u32::from_le_bytes(chosen.last().unwrap()[..].try_into().unwrap());
+        assert!(last > 900, "sample stopped at {last}");
+    }
+
+    /// Repeats are kept deliberately — they are the evidence a constant column
+    /// is padding rather than a thin sample.
+    #[test]
+    fn test_strided_samples_keep_repeats() {
+        let frames: Vec<Vec<u8>> = std::iter::repeat_n(vec![0u8; 8], 40).collect();
+        assert_eq!(strided_samples(&frames, 200).len(), 40);
+    }
+
+    #[test]
+    fn test_strided_samples_drop_empty_frames() {
+        assert_eq!(strided_samples(&[vec![], vec![1]], 200), vec![vec![1]]);
     }
 
     #[test]

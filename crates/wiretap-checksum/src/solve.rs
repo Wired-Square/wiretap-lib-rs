@@ -44,10 +44,14 @@
 //! which CAN — one DLC per frame id — does not provide.
 
 use rayon::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::algorithms::{crc16_parameterised, crc8_parameterised};
-use crate::frame::{extract_checksum, resolve_byte_index};
+use crate::algorithms::{
+    calculate_checksum_simple, crc16_parameterised, crc8_parameterised, ChecksumAlgorithm,
+    ALL_ALGORITHMS,
+};
+use crate::detect::CalcRange;
+use crate::frame::{calculated_range, extract_checksum};
 
 /// Well-known polynomials, preferred when several reproduce the data equally
 /// well. Recognising a standard is worth more to a reader than an arbitrary
@@ -57,6 +61,24 @@ const KNOWN_CRC8_POLYNOMIALS: [u16; 7] = [0x07, 0x1D, 0x2F, 0x31, 0x9B, 0xD5, 0x
 const KNOWN_CRC16_POLYNOMIALS: [u16; 8] = [
     0x8005, 0x1021, 0x3D65, 0x8BB7, 0xC867, 0x0589, 0x080D, 0x1DCF,
 ];
+
+/// The id a recovered CRC is stored under. It is not one of the eleven — its
+/// parameters travel with the declaration.
+pub const CRC_CUSTOM: &str = "crc_custom";
+
+/// The id for a sum negated into two's complement, likewise unnameable by the
+/// fixed list.
+pub const SUM8_NEGATED: &str = "sum8_negated";
+
+/// Every algorithm id a stored checksum may use: the eleven named ones plus the
+/// two parameterised shapes the solver recovers.
+pub fn all_algorithm_ids() -> Vec<&'static str> {
+    ALL_ALGORITHMS
+        .iter()
+        .map(|a| a.as_str())
+        .chain([CRC_CUSTOM, SUM8_NEGATED])
+        .collect()
+}
 
 /// Conventional initial values reported as alternatives.
 const CONVENTIONAL_INITS: [u16; 2] = [0x0000, 0xFFFF];
@@ -83,7 +105,7 @@ pub struct SolveTarget {
 }
 
 /// The additive families, in the order they are tried.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AdditiveOp {
     /// `observed = XOR(range) ⊕ offset`
@@ -95,7 +117,7 @@ pub enum AdditiveOp {
 }
 
 /// One conventional `init` and the `xorOut` it implies for this residue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CrcAlternative {
     pub init: u16,
@@ -104,7 +126,7 @@ pub struct CrcAlternative {
 
 /// A recovered CRC. `init`/`xor_out` are the canonical pair — always exact, and
 /// always one of several that fit; see [`alternatives`](Self::alternatives).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CrcParameters {
     /// 8 or 16.
@@ -123,11 +145,142 @@ pub struct CrcParameters {
     pub alternatives: Vec<CrcAlternative>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// How a checksum is computed.
+///
+/// One type for all three answers the engine can give: a named algorithm from
+/// the scored sweep, or one of the two families [`solve_additive`] and
+/// [`solve_crc`] recover, which carry parameters no fixed list can express.
+/// They were declared separately either side of the crate boundary and sorted
+/// against each other in one list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
-pub enum SolvedKind {
+pub enum ChecksumSpecification {
+    Named { algorithm: ChecksumAlgorithm },
     Additive { op: AdditiveOp, offset: u8 },
     Crc(CrcParameters),
+}
+
+/// A specification's identity ignoring what a calculation range absorbs.
+///
+/// A constant range contributes a constant, which a sum takes into its offset
+/// and a CRC into its `init`/`xorOut` residue. So two solutions of the same
+/// family over different ranges differ in exactly those fields and agree on
+/// everything else — and comparing them is the whole basis of the fold.
+///
+/// Deriving this from an exhaustive match, rather than hand-listing fields at
+/// the point of comparison, is what stops a new checksum family from compiling
+/// cleanly and silently never folding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ChecksumFamily {
+    Named(ChecksumAlgorithm),
+    Additive(AdditiveOp),
+    /// Width, polynomial and the two reflections. `init` and `xor_out` are the
+    /// residue, and the residue moves with the range.
+    Crc {
+        width: u8,
+        polynomial: u16,
+        reflect_in: bool,
+        reflect_out: bool,
+    },
+}
+
+impl ChecksumSpecification {
+    pub(crate) fn family(&self) -> ChecksumFamily {
+        match self {
+            Self::Named { algorithm } => ChecksumFamily::Named(*algorithm),
+            Self::Additive { op, .. } => ChecksumFamily::Additive(*op),
+            Self::Crc(crc) => ChecksumFamily::Crc {
+                width: crc.width,
+                polynomial: crc.polynomial,
+                reflect_in: crc.reflect_in,
+                reflect_out: crc.reflect_out,
+            },
+        }
+    }
+}
+
+impl ChecksumSpecification {
+    /// The catalogue id this serialises as.
+    ///
+    /// Exhaustive, and beside the type it names, so a new family cannot be
+    /// added without deciding what it is called. The ids used to be spelled by
+    /// hand wherever one was written or read.
+    pub fn algorithm_id(&self) -> &'static str {
+        match self {
+            Self::Named { algorithm } => algorithm.as_str(),
+            Self::Additive { op, .. } => match op {
+                AdditiveOp::Xor => ChecksumAlgorithm::Xor.as_str(),
+                AdditiveOp::Sum => ChecksumAlgorithm::Sum8.as_str(),
+                AdditiveOp::NegatedSum => SUM8_NEGATED,
+            },
+            Self::Crc(_) => CRC_CUSTOM,
+        }
+    }
+
+    /// Apply this configuration to the bytes it is calculated over.
+    ///
+    /// The counterpart to solving: [`solve_additive`] and [`solve_crc`] work out
+    /// *what* a checksum is, and this reproduces it. Without it a caller holding
+    /// a stored configuration has no way to check it except by parsing the
+    /// algorithm id and hoping the parameters beside it do not matter — which
+    /// silently mis-reads every offset sum, because those are stored as `sum8`.
+    pub fn calculate(&self, data: &[u8]) -> u16 {
+        match self {
+            Self::Named { algorithm } => calculate_checksum_simple(*algorithm, data),
+            Self::Additive { op, offset } => {
+                let value = match op {
+                    AdditiveOp::Xor => data.iter().fold(0u8, |a, b| a ^ b) ^ *offset,
+                    AdditiveOp::Sum => data
+                        .iter()
+                        .fold(0u8, |a, b| a.wrapping_add(*b))
+                        .wrapping_add(*offset),
+                    AdditiveOp::NegatedSum => {
+                        offset.wrapping_sub(data.iter().fold(0u8, |a, b| a.wrapping_add(*b)))
+                    }
+                };
+                value as u16
+            }
+            Self::Crc(crc) => {
+                if crc.width == 8 {
+                    crc8_parameterised(
+                        data,
+                        crc.polynomial as u8,
+                        crc.init as u8,
+                        crc.xor_out as u8,
+                        crc.reflect_in,
+                    ) as u16
+                } else {
+                    crc16_parameterised(
+                        data,
+                        crc.polynomial,
+                        crc.init,
+                        crc.xor_out,
+                        crc.reflect_in,
+                        crc.reflect_out,
+                    )
+                }
+            }
+        }
+    }
+
+    /// Whether the scored sweep of named algorithms can already express this.
+    ///
+    /// A plain XOR or Sum with no offset *is* one of the eleven, so reporting it
+    /// as a solved answer duplicates a candidate the sweep already scored with a
+    /// measured rate. Only the variants the fixed list cannot express are news.
+    ///
+    /// It lives here, matched exhaustively, because it is a claim about what
+    /// [`ChecksumAlgorithm`] covers — a caller asserting it from outside goes
+    /// silently wrong the day a `Sum16` joins the list.
+    pub fn is_expressible_by_sweep(&self) -> bool {
+        match self {
+            Self::Named { .. } => true,
+            Self::Additive { op, offset } => {
+                *offset == 0 && matches!(op, AdditiveOp::Xor | AdditiveOp::Sum)
+            }
+            Self::Crc(_) => false,
+        }
+    }
 }
 
 /// A configuration that reproduces every sample it was solved against.
@@ -136,13 +289,17 @@ pub enum SolvedKind {
 pub struct SolvedChecksum {
     pub target: SolveTarget,
     #[serde(flatten)]
-    pub kind: SolvedKind,
+    pub specification: ChecksumSpecification,
     /// Samples the solution was verified against. A solution is only reported
     /// when it reproduces all of them, so there is no match *rate* here.
     pub sample_count: usize,
     /// Samples excluded because their calculation range was a different length.
     /// Always 0 for the additive solutions.
     pub excluded_count: usize,
+    /// Ranges that explain the samples equally well, folded in by
+    /// [`collapse_solved`]. Non-empty means the bytes between them never
+    /// changed, so the data cannot say which is right.
+    pub equivalent_ranges: Vec<CalcRange>,
 }
 
 #[derive(Debug, Clone)]
@@ -174,14 +331,15 @@ fn observations(frames: &[Vec<u8>], target: &SolveTarget) -> Vec<Observation> {
     frames
         .iter()
         .filter_map(|frame| {
-            let len = frame.len();
-            if resolve_byte_index(target.position, len) + target.byte_length > len {
-                return None;
-            }
-            let start = resolve_byte_index(target.calc_start_byte, len).min(len);
-            let end = resolve_byte_index(target.calc_end_byte, len).min(len);
-            (start < end).then(|| Observation {
-                data: frame[start..end].to_vec(),
+            let range = calculated_range(
+                frame.len(),
+                target.position,
+                target.byte_length,
+                target.calc_start_byte,
+                target.calc_end_byte,
+            )?;
+            Some(Observation {
+                data: frame[range].to_vec(),
                 observed: extract_checksum(
                     frame,
                     target.position,
@@ -229,9 +387,10 @@ pub fn solve_additive(frames: &[Vec<u8>], target: &SolveTarget) -> Option<Solved
                 .all(|s| residue(op, s) == offset)
                 .then_some(SolvedChecksum {
                     target: *target,
-                    kind: SolvedKind::Additive { op, offset },
+                    specification: ChecksumSpecification::Additive { op, offset },
                     sample_count: samples.len(),
                     excluded_count: 0,
+                    equivalent_ranges: Vec::new(),
                 })
         })
 }
@@ -362,11 +521,72 @@ pub fn solve_crc(
         .into_iter()
         .map(|crc| SolvedChecksum {
             target: *target,
-            kind: SolvedKind::Crc(crc),
+            specification: ChecksumSpecification::Crc(crc),
             sample_count: samples.len(),
             excluded_count: all.len() - samples.len(),
+            equivalent_ranges: Vec::new(),
         })
         .collect()
+}
+
+/// Solve every target, and fold the duplicates the range space produces.
+///
+/// The entry point a caller should use. [`crate::calc_ranges`] deliberately
+/// offers the solver every range the sweep searches, and wherever the bytes
+/// between two of those ranges never change, *both* solve — with a different
+/// offset or residue each. Those are one answer written several ways, and
+/// reporting them as several would make the wider search read as noise.
+///
+/// Folding here rather than in the caller is the point: the crate produces the
+/// duplicates, so the crate clears them up. Leaving it to a doc comment is how
+/// a second consumer ends up without it.
+pub fn solve_all(
+    frames: &[Vec<u8>],
+    targets: &[SolveTarget],
+    options: &CrcSolveOptions,
+) -> Vec<SolvedChecksum> {
+    let solutions = targets
+        .iter()
+        .flat_map(|target| {
+            solve_additive(frames, target)
+                .into_iter()
+                .chain(solve_crc(frames, target, options))
+        })
+        .collect();
+    collapse_solved(solutions)
+}
+
+/// Fold solutions that differ only in a range the data cannot tell apart.
+///
+/// The widest range wins — lowest start, end furthest into the frame — and the
+/// rest become its `equivalent_ranges`. When only one range solves, the excluded
+/// bytes *did* move, and that single answer is the real one.
+fn collapse_solved(mut solutions: Vec<SolvedChecksum>) -> Vec<SolvedChecksum> {
+    // Widest first, so the survivor of each group is the parsimonious one.
+    solutions.sort_by(|a, b| {
+        a.target
+            .calc_start_byte
+            .cmp(&b.target.calc_start_byte)
+            .then_with(|| b.target.calc_end_byte.cmp(&a.target.calc_end_byte))
+    });
+
+    let mut kept: Vec<SolvedChecksum> = Vec::new();
+    for solution in solutions {
+        let same = |k: &SolvedChecksum| {
+            k.target.position == solution.target.position
+                && k.target.byte_length == solution.target.byte_length
+                && k.target.big_endian == solution.target.big_endian
+                && k.specification.family() == solution.specification.family()
+        };
+        match kept.iter_mut().find(|k| same(k)) {
+            Some(winner) => winner.equivalent_ranges.push(CalcRange {
+                calc_start_byte: solution.target.calc_start_byte,
+                calc_end_byte: solution.target.calc_end_byte,
+            }),
+            None => kept.push(solution),
+        }
+    }
+    kept
 }
 
 fn largest_length_group(samples: &[Observation]) -> Option<usize> {
@@ -461,8 +681,8 @@ mod tests {
     /// The one CRC a solve is expected to find. Panics on an empty result so a
     /// failure reads as "found nothing" rather than an index panic.
     fn only_crc(solved: &[SolvedChecksum]) -> CrcParameters {
-        match solved.first().map(|s| &s.kind) {
-            Some(SolvedKind::Crc(crc)) => crc.clone(),
+        match solved.first().map(|s| &s.specification) {
+            Some(ChecksumSpecification::Crc(crc)) => crc.clone(),
             other => panic!("expected a CRC, got {other:?}"),
         }
     }
@@ -473,8 +693,8 @@ mod tests {
     fn test_solve_additive_finds_a_plain_sum() {
         let solved = solve_additive(&frames_with(40, sum8_checksum), &TRAILING_BYTE).unwrap();
         assert_eq!(
-            solved.kind,
-            SolvedKind::Additive {
+            solved.specification,
+            ChecksumSpecification::Additive {
                 op: AdditiveOp::Sum,
                 offset: 0
             }
@@ -486,8 +706,8 @@ mod tests {
     fn test_solve_additive_finds_a_plain_xor() {
         let solved = solve_additive(&frames_with(40, xor_checksum), &TRAILING_BYTE).unwrap();
         assert_eq!(
-            solved.kind,
-            SolvedKind::Additive {
+            solved.specification,
+            ChecksumSpecification::Additive {
                 op: AdditiveOp::Xor,
                 offset: 0
             }
@@ -501,8 +721,8 @@ mod tests {
         let frames = frames_with(40, |d| sum8_checksum(d).wrapping_add(0xA5));
         let solved = solve_additive(&frames, &TRAILING_BYTE).unwrap();
         assert_eq!(
-            solved.kind,
-            SolvedKind::Additive {
+            solved.specification,
+            ChecksumSpecification::Additive {
                 op: AdditiveOp::Sum,
                 offset: 0xA5
             }
@@ -514,8 +734,8 @@ mod tests {
         let frames = frames_with(40, |d| sum8_checksum(d).wrapping_neg());
         let solved = solve_additive(&frames, &TRAILING_BYTE).unwrap();
         assert_eq!(
-            solved.kind,
-            SolvedKind::Additive {
+            solved.specification,
+            ChecksumSpecification::Additive {
                 op: AdditiveOp::NegatedSum,
                 offset: 0
             }
@@ -687,6 +907,96 @@ mod tests {
             only_crc(&solve_crc(&prefixed, &TRAILING_BYTE, &Default::default())).polynomial;
 
         assert_eq!(bare, with_prefix);
+    }
+
+    // ---- Folding what the range space duplicates ---------------------------
+
+    /// Every start solves when the bytes they differ by never change, because a
+    /// constant range is absorbed — into the offset here. One answer, and it
+    /// must come back as one.
+    #[test]
+    fn test_solve_all_folds_ranges_the_data_cannot_tell_apart() {
+        // Bytes 0 and 1 are constant, so starts 0, 1 and 2 all reproduce the
+        // frames with a different offset each.
+        let frames: Vec<Vec<u8>> = (0..40u32)
+            .map(|i| {
+                let mut body = vec![0x10, 0x20, i as u8, (i.wrapping_mul(37) ^ 0x5A) as u8];
+                body.push(sum8_checksum(&body).wrapping_add(0xA5));
+                body
+            })
+            .collect();
+
+        let targets: Vec<SolveTarget> = [0, 1, 2]
+            .iter()
+            .map(|start| SolveTarget {
+                calc_start_byte: *start,
+                ..TRAILING_BYTE
+            })
+            .collect();
+
+        let solved = solve_all(&frames, &targets, &Default::default());
+        assert_eq!(
+            solved.len(),
+            1,
+            "one answer, {} ways: {solved:?}",
+            solved.len()
+        );
+        // The widest range wins; the others are kept rather than dropped,
+        // because none of them is more true than another.
+        assert_eq!(solved[0].target.calc_start_byte, 0);
+        assert_eq!(
+            solved[0].specification,
+            ChecksumSpecification::Additive {
+                op: AdditiveOp::Sum,
+                offset: 0xA5
+            }
+        );
+        let starts: Vec<i32> = solved[0]
+            .equivalent_ranges
+            .iter()
+            .map(|r| r.calc_start_byte)
+            .collect();
+        assert_eq!(starts, vec![1, 2]);
+    }
+
+    /// The other direction, and the reason the wider range space exists: a
+    /// leading byte that *moves* is not absorbed, so only the range excluding it
+    /// solves and there is nothing to be ambiguous about.
+    #[test]
+    fn test_solve_all_keeps_the_one_range_that_fits_when_the_prefix_moves() {
+        let frames: Vec<Vec<u8>> = (0..40u32)
+            .map(|i| {
+                let mut body = vec![(i % 7) as u8, i as u8, (i.wrapping_mul(37) ^ 0x5A) as u8];
+                body.push(sum8_checksum(&body[1..]));
+                body
+            })
+            .collect();
+
+        let targets: Vec<SolveTarget> = [0, 1, 2]
+            .iter()
+            .map(|start| SolveTarget {
+                calc_start_byte: *start,
+                ..TRAILING_BYTE
+            })
+            .collect();
+
+        let solved = solve_all(&frames, &targets, &Default::default());
+        assert_eq!(solved.len(), 1, "{solved:?}");
+        assert_eq!(solved[0].target.calc_start_byte, 1);
+        assert!(solved[0].equivalent_ranges.is_empty());
+    }
+
+    /// Two genuinely different explanations must stay two. `family()` keys the
+    /// fold, so a different polynomial is a different answer however similar the
+    /// geometry.
+    #[test]
+    fn test_collapse_keeps_different_families_apart() {
+        let frames = frames_with(40, crc8_checksum);
+        let solved = solve_all(&frames, &[TRAILING_BYTE], &Default::default());
+        let families: std::collections::HashSet<_> =
+            solved.iter().map(|s| s.specification.family()).collect();
+
+        assert_eq!(families.len(), solved.len(), "{solved:?}");
     }
 
     /// The whole point is that this is affordable. An exhaustive 16-bit sweep is
