@@ -190,16 +190,163 @@ pub struct Mux {
 pub struct FrameChecksum {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// A named algorithm, or one of the parameterised ids
+    /// ([`wiretap_checksum::CRC_CUSTOM`], [`wiretap_checksum::SUM8_NEGATED`]).
     pub algorithm: String,
-    pub start_byte: u32,
+    /// Byte offset of the checksum. **Negative counts from the end**, which is
+    /// how detection reports every position — these were `u32`, so no detected
+    /// checksum survived a reload.
+    pub start_byte: i32,
     #[serde(default = "one")]
     pub byte_length: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endianness: Option<Endianness>,
+    /// First byte of the calculation range.
     #[serde(default)]
-    pub calc_start_byte: u32,
+    pub calc_start_byte: i32,
+    /// Last byte of the calculation range, exclusive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub calc_end_byte: Option<u32>,
+    pub calc_end_byte: Option<i32>,
+    /// Parameters for a configuration no named algorithm can express.
+    ///
+    /// A recovered CRC carries all of `polynomial`/`width`/`init`/`xor_out` and
+    /// the two reflections; an offset sum carries only `offset`. Absent for the
+    /// eleven named algorithms, which define their own.
+    #[serde(flatten)]
+    pub parameters: ChecksumParameters,
+    /// Free text carried with the declaration. A recovered CRC records here that
+    /// its `init`/`xorOut` pair is one of several that fit — the crate is
+    /// emphatic that presenting one as *the* answer is wrong, and a catalogue
+    /// that stores only the pair would do exactly that.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+impl FrameChecksum {
+    /// A catalogue entry for a configuration discovery worked out.
+    ///
+    /// Takes the whole solved result rather than its parts: the geometry is five
+    /// scalars of near-identical type, and the caller always holds them bundled
+    /// already.
+    pub fn from_solved(name: Option<String>, solved: &wiretap_checksum::SolvedChecksum) -> Self {
+        use wiretap_checksum::ChecksumSpecification;
+
+        let target = solved.target;
+        let parameters = match &solved.specification {
+            ChecksumSpecification::Named { .. } => ChecksumParameters::default(),
+            ChecksumSpecification::Additive { offset, .. } => ChecksumParameters {
+                offset: Some(*offset),
+                ..Default::default()
+            },
+            ChecksumSpecification::Crc(crc) => ChecksumParameters {
+                polynomial: Some(crc.polynomial),
+                init: Some(crc.init),
+                xor_out: Some(crc.xor_out),
+                reflect_in: Some(crc.reflect_in),
+                reflect_out: Some(crc.reflect_out),
+                offset: None,
+            },
+        };
+
+        // The engine is emphatic that `init`/`xorOut` are not separately
+        // identifiable from fixed-length payloads. Storing the pair without
+        // saying so would present a guess as the answer.
+        let mut notes = Vec::new();
+        if let ChecksumSpecification::Crc(crc) = &solved.specification {
+            if !crc.alternatives.is_empty() {
+                notes.push(format!(
+                    "init/xorOut are not separately identifiable from fixed-length payloads; {} other pair(s) reproduce this data identically",
+                    crc.alternatives.len()
+                ));
+            }
+        }
+
+        Self {
+            name,
+            algorithm: solved.specification.algorithm_id().to_string(),
+            start_byte: target.position,
+            byte_length: target.byte_length as u32,
+            endianness: (target.byte_length > 1).then_some(if target.big_endian {
+                Endianness::Big
+            } else {
+                Endianness::Little
+            }),
+            calc_start_byte: target.calc_start_byte,
+            calc_end_byte: Some(target.calc_end_byte),
+            parameters,
+            notes,
+        }
+    }
+
+    /// The configuration this declaration describes, if it is coherent.
+    ///
+    /// The inverse of [`from_solved`](Self::from_solved), and the half that was
+    /// missing: the algorithm id is not a faithful encoding on its own, because
+    /// a plain sum and a sum with an offset are both stored as `sum8` and differ
+    /// only by a field the id cannot carry. A reader with just the id
+    /// mis-verifies the second as the first.
+    pub fn specification(&self) -> Option<wiretap_checksum::ChecksumSpecification> {
+        use wiretap_checksum::{
+            AdditiveOp, ChecksumAlgorithm, ChecksumSpecification, CrcParameters, CRC_CUSTOM,
+            SUM8_NEGATED,
+        };
+        let p = &self.parameters;
+
+        if self.algorithm == CRC_CUSTOM {
+            return Some(ChecksumSpecification::Crc(CrcParameters {
+                // The CRC's width *is* how many bytes the checksum occupies;
+                // storing it again invites the two to disagree.
+                width: (self.byte_length * 8) as u8,
+                polynomial: p.polynomial?,
+                reflect_in: p.reflect_in.unwrap_or(false),
+                reflect_out: p.reflect_out.unwrap_or(false),
+                init: p.init.unwrap_or(0),
+                xor_out: p.xor_out.unwrap_or(0),
+                well_known: false,
+                alternatives: Vec::new(),
+            }));
+        }
+        if self.algorithm == SUM8_NEGATED {
+            return Some(ChecksumSpecification::Additive {
+                op: AdditiveOp::NegatedSum,
+                offset: p.offset.unwrap_or(0),
+            });
+        }
+
+        let algorithm: ChecksumAlgorithm = self.algorithm.parse().ok()?;
+        // An offset is precisely what the fixed list cannot express, so a
+        // declaration carrying one is the additive family however it is named.
+        match (algorithm, p.offset) {
+            (ChecksumAlgorithm::Xor, Some(offset)) => Some(ChecksumSpecification::Additive {
+                op: AdditiveOp::Xor,
+                offset,
+            }),
+            (ChecksumAlgorithm::Sum8, Some(offset)) => Some(ChecksumSpecification::Additive {
+                op: AdditiveOp::Sum,
+                offset,
+            }),
+            _ => Some(ChecksumSpecification::Named { algorithm }),
+        }
+    }
+}
+
+/// The parameters a solved checksum needs and a named one does not.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChecksumParameters {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub polynomial: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xor_out: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflect_in: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflect_out: Option<bool>,
+    /// The constant an additive checksum adds after summing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u8>,
 }
 
 /// A resolved frame: one CAN message / serial frame / Modbus register read,
@@ -326,13 +473,14 @@ pub struct CanConfig {
 #[serde(rename_all = "camelCase")]
 pub struct ChecksumConfig {
     pub algorithm: String,
-    pub start_byte: u32,
+    /// End-relative when negative — see [`FrameChecksum::start_byte`].
+    pub start_byte: i32,
     #[serde(default = "one")]
     pub byte_length: u32,
     #[serde(default)]
-    pub calc_start_byte: u32,
+    pub calc_start_byte: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub calc_end_byte: Option<u32>,
+    pub calc_end_byte: Option<i32>,
     #[serde(default)]
     pub big_endian: bool,
 }

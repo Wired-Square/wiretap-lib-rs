@@ -47,6 +47,43 @@ fn as_u32(v: &Value, key: &str) -> Option<u32> {
     as_i64(v, key).and_then(|i| u32::try_from(i).ok())
 }
 
+fn as_u8(v: &Value, key: &str) -> Option<u8> {
+    as_i64(v, key).and_then(|i| u8::try_from(i).ok())
+}
+
+fn as_u16(v: &Value, key: &str) -> Option<u16> {
+    as_i64(v, key).and_then(|i| u16::try_from(i).ok())
+}
+
+/// A byte offset, in three states: absent (`Some(None)`), a usable signed
+/// integer (`Some(Some(n))`), or present but unusable (`None`).
+///
+/// The third state is the point. A *present* value that will not fit is an
+/// authoring error, not a default — it drops the whole checksum rather than
+/// quietly reading as 0, because a checksum calculated over the wrong bytes is
+/// worse than one that is missing. That silent `unwrap_or(0)` was the open bug
+/// this replaces.
+fn byte_offset(v: &Value, key: &str) -> Option<Option<i32>> {
+    match get(v, key) {
+        None => Some(None),
+        Some(raw) => raw
+            .as_integer()
+            .and_then(|i| i32::try_from(i).ok())
+            .map(Some),
+    }
+}
+
+fn parse_checksum_parameters(c: &Value) -> ChecksumParameters {
+    ChecksumParameters {
+        polynomial: as_u16(c, "polynomial"),
+        init: as_u16(c, "init"),
+        xor_out: as_u16(c, "xor_out"),
+        reflect_in: as_bool(c, "reflect_in"),
+        reflect_out: as_bool(c, "reflect_out"),
+        offset: as_u8(c, "offset"),
+    }
+}
+
 fn parse_endianness(s: &str) -> Option<Endianness> {
     match s {
         "big" => Some(Endianness::Big),
@@ -238,11 +275,13 @@ fn parse_frame_checksums(body: &Value) -> Vec<FrameChecksum> {
         Some(FrameChecksum {
             name: as_str(c, "name").map(str::to_string),
             algorithm: as_str(c, "algorithm")?.to_string(),
-            start_byte: as_u32(c, "start_byte")?,
+            start_byte: byte_offset(c, "start_byte")??,
             byte_length: as_u32(c, "byte_length").unwrap_or(1),
             endianness: endianness_at(c, "byte_order").or_else(|| endianness_at(c, "endianness")),
-            calc_start_byte: as_u32(c, "calc_start_byte").unwrap_or(0),
-            calc_end_byte: as_u32(c, "calc_end_byte"),
+            calc_start_byte: byte_offset(c, "calc_start_byte")?.unwrap_or(0),
+            calc_end_byte: byte_offset(c, "calc_end_byte")?,
+            parameters: parse_checksum_parameters(c),
+            notes: parse_notes(c),
         })
     };
     match get(body, "checksum") {
@@ -261,7 +300,7 @@ fn parse_nodes(root: &Value) -> Vec<NodeDef> {
         .iter()
         .map(|(name, body)| NodeDef {
             name: name.clone(),
-            device_address: as_i64(body, "device_address").and_then(|i| u8::try_from(i).ok()),
+            device_address: as_u8(body, "device_address"),
             notes: parse_notes(body),
         })
         .collect()
@@ -533,13 +572,12 @@ fn parse_serial_config(root: &Value) -> Option<SerialConfig> {
 
 fn parse_checksum(section: &Value) -> Option<ChecksumConfig> {
     let algorithm = as_str(section, "algorithm")?.to_string();
-    let start_byte = as_u32(section, "start_byte")?;
     Some(ChecksumConfig {
         algorithm,
-        start_byte,
+        start_byte: byte_offset(section, "start_byte")??,
         byte_length: as_u32(section, "byte_length").unwrap_or(1),
-        calc_start_byte: as_u32(section, "calc_start_byte").unwrap_or(0),
-        calc_end_byte: as_u32(section, "calc_end_byte"),
+        calc_start_byte: byte_offset(section, "calc_start_byte")?.unwrap_or(0),
+        calc_end_byte: byte_offset(section, "calc_end_byte")?,
         big_endian: as_bool(section, "big_endian").unwrap_or(false),
     })
 }
@@ -552,7 +590,7 @@ fn parse_modbus_config(root: &Value) -> Option<ModbusConfig> {
         _ => None,
     };
     let cfg = ModbusConfig {
-        device_address: as_i64(section, "device_address").and_then(|i| u8::try_from(i).ok()),
+        device_address: as_u8(section, "device_address"),
         register_base,
         default_interval: as_i64(section, "default_interval").and_then(|i| u64::try_from(i).ok()),
         default_byte_order: endianness_at(section, "default_byte_order")
@@ -1443,5 +1481,72 @@ bit_length = 8
         let json = serde_json::to_string(&c).unwrap();
         let back: Catalog = serde_json::from_str(&json).unwrap();
         assert_eq!(c, back);
+    }
+    /// The break that had never worked: detection reports positions from the
+    /// *end* of the frame, and the model typed them unsigned — so an exported
+    /// checksum was dropped on reload (`start_byte`) or silently re-ranged
+    /// (`calc_start_byte`, which defaulted to 0).
+    #[test]
+    fn end_relative_checksum_offsets_survive_a_reload() {
+        let toml = r#"
+[meta]
+name = "x"
+[frame.can.0x100]
+length = 8
+[[frame.can.0x100.checksum]]
+algorithm = "sum8"
+start_byte = -1
+calc_start_byte = 1
+calc_end_byte = -1
+"#;
+        let c = Catalog::parse(toml).unwrap();
+        let checksum = &c.frame(0x100).unwrap().checksums[0];
+
+        assert_eq!(checksum.start_byte, -1);
+        assert_eq!(checksum.calc_start_byte, 1);
+        assert_eq!(checksum.calc_end_byte, Some(-1));
+    }
+
+    /// A recovered CRC is not one of the eleven, so its parameters ride on the
+    /// declaration. Without them a saved answer is unusable.
+    #[test]
+    fn a_solved_crc_carries_its_parameters() {
+        let toml = r#"
+[meta]
+name = "x"
+[frame.can.0x101]
+length = 8
+[[frame.can.0x101.checksum]]
+algorithm = "crc_custom"
+start_byte = -1
+byte_length = 1
+polynomial = 77
+init = 0
+xor_out = 183
+reflect_in = false
+"#;
+        let c = Catalog::parse(toml).unwrap();
+        let p = &c.frame(0x101).unwrap().checksums[0].parameters;
+
+        assert_eq!(p.polynomial, Some(77));
+        assert_eq!(p.xor_out, Some(183));
+        assert_eq!(p.reflect_in, Some(false));
+    }
+
+    /// A present-but-unusable offset drops the checksum; see [`byte_offset`].
+    #[test]
+    fn a_malformed_offset_drops_the_checksum_rather_than_defaulting() {
+        let toml = r#"
+[meta]
+name = "x"
+[frame.can.0x102]
+length = 8
+[[frame.can.0x102.checksum]]
+algorithm = "sum8"
+start_byte = -1
+calc_start_byte = "nonsense"
+"#;
+        let c = Catalog::parse(toml).unwrap();
+        assert!(c.frame(0x102).unwrap().checksums.is_empty());
     }
 }

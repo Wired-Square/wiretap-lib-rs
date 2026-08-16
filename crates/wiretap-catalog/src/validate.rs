@@ -6,11 +6,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use toml::Value;
 
 use crate::modbus::{ManifestError, ModbusManifest};
-use crate::model::ValidationError;
+use crate::model::{Endianness, FrameChecksum, ValidationError};
 use crate::parse::parse_id;
 
 fn err(field: impl Into<String>, message: impl Into<String>) -> ValidationError {
@@ -347,20 +347,15 @@ fn validate_mux_object(prefix: &str, mux: &Value, errors: &mut Vec<ValidationErr
 // `validate.ts` + `protocols/*.ts`). Exposed over WS as `catalog.validate*`.
 // ===========================================================================
 
-/// Canonical checksum algorithm ids (ported from the editor's checksum list).
-const CHECKSUM_ALGORITHMS: &[&str] = &[
-    "xor",
-    "sum8",
-    "crc8",
-    "crc8_sae_j1850",
-    "crc8_autosar",
-    "crc8_maxim",
-    "crc8_cdma2000",
-    "crc8_dvb_s2",
-    "crc8_nissan",
-    "crc16_modbus",
-    "crc16_ccitt",
-];
+/// The algorithm ids a catalogue may declare.
+///
+/// Owned by [`wiretap_checksum`], beside the specification they serialise — this
+/// list had been transcribed from the editor, so it could not know about a
+/// twelfth algorithm nor about the two parameterised shapes discovery now
+/// solves.
+fn checksum_algorithm_ids() -> Vec<&'static str> {
+    wiretap_checksum::all_algorithm_ids()
+}
 
 fn is_hex_id(s: &str) -> bool {
     s.strip_prefix("0x")
@@ -499,6 +494,71 @@ pub struct ChecksumInput {
     pub frame_length: i64,
 }
 
+/// How well a declared checksum reproduces real frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChecksumVerification {
+    /// Frames the declaration reproduced.
+    pub matched: usize,
+    /// Frames it was measured against. Frames that cannot carry the checksum, or
+    /// leave nothing to calculate over, are excluded rather than counted as
+    /// failures — one bare acknowledgement sharing a link must not condemn the
+    /// declaration.
+    pub total: usize,
+}
+
+impl ChecksumVerification {
+    pub fn holds(&self) -> bool {
+        self.total > 0 && self.matched == self.total
+    }
+}
+
+/// Check a declared checksum against real frames.
+///
+/// The payoff of depending on [`wiretap_checksum`]: a catalogue's declaration is
+/// evaluated by the engine that discovers checksums, rather than by a second
+/// implementation that can disagree with it.
+///
+/// It goes through [`FrameChecksum::specification`] rather than the algorithm id,
+/// and that distinction is the whole point — a sum with a constant offset is
+/// stored as `sum8` with the offset beside it, so a verifier reading only the id
+/// would reproduce a *different* checksum and report a correct declaration as
+/// completely broken.
+///
+/// `None` when the declaration is not coherent enough to evaluate: an unknown
+/// algorithm, or a `crc_custom` missing its polynomial.
+pub fn verify_frame_checksum(
+    declared: &FrameChecksum,
+    frames: &[Vec<u8>],
+) -> Option<ChecksumVerification> {
+    let specification = declared.specification()?;
+    let big_endian = !matches!(declared.endianness, Some(Endianness::Little));
+    let byte_length = declared.byte_length as usize;
+    let calc_end = declared.calc_end_byte.unwrap_or(declared.start_byte);
+
+    let mut matched = 0;
+    let mut total = 0;
+    for frame in frames {
+        let Some(range) = wiretap_checksum::calculated_range(
+            frame.len(),
+            declared.start_byte,
+            byte_length,
+            declared.calc_start_byte,
+            calc_end,
+        ) else {
+            continue;
+        };
+        total += 1;
+        let expected =
+            wiretap_checksum::extract_checksum(frame, declared.start_byte, byte_length, big_endian);
+        if specification.calculate(&frame[range]) == expected {
+            matched += 1;
+        }
+    }
+
+    Some(ChecksumVerification { matched, total })
+}
+
 pub fn validate_checksum_fields(c: &ChecksumInput) -> Vec<ValidationError> {
     let mut e = Vec::new();
     let frame_length = c.frame_length;
@@ -506,12 +566,12 @@ pub fn validate_checksum_fields(c: &ChecksumInput) -> Vec<ValidationError> {
     if c.name.trim().is_empty() {
         e.push(err("checksum.name", "Name is required"));
     }
-    if !CHECKSUM_ALGORITHMS.contains(&c.algorithm.as_str()) {
+    if !checksum_algorithm_ids().contains(&c.algorithm.as_str()) {
         e.push(err(
             "checksum.algorithm",
             format!(
                 "Algorithm must be one of: {}",
-                CHECKSUM_ALGORITHMS.join(", ")
+                checksum_algorithm_ids().join(", ")
             ),
         ));
     }
@@ -1016,5 +1076,166 @@ length = 4
         }))
         .unwrap();
         assert!(validate_checksum_fields(&ok).is_empty());
+    }
+    /// A declaration, with only the fields a test actually varies.
+    fn declared(algorithm: &str, calc_start_byte: i32) -> FrameChecksum {
+        FrameChecksum {
+            name: None,
+            algorithm: algorithm.into(),
+            start_byte: -1,
+            byte_length: 1,
+            endianness: None,
+            calc_start_byte,
+            calc_end_byte: Some(-1),
+            parameters: Default::default(),
+            notes: Vec::new(),
+        }
+    }
+
+    /// Frames whose last byte is `sum8` over `body[from..]`.
+    fn summed(count: u8, from: usize) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|i| {
+                let mut f = vec![0x10, i, i.wrapping_mul(7)];
+                f.push(wiretap_checksum::algorithms::sum8_checksum(&f[from..]));
+                f
+            })
+            .collect()
+    }
+
+    /// The payoff of the dependency: a declaration is checked by the engine that
+    /// discovers checksums, not by a second implementation that can disagree.
+    #[test]
+    fn a_declared_checksum_is_verified_against_real_frames() {
+        let frames = summed(20, 1);
+        let holds = verify_frame_checksum(&declared("sum8", 1), &frames).unwrap();
+
+        assert!(holds.holds(), "{holds:?}");
+        assert_eq!(holds.total, 20);
+        // The same declaration over the wrong range must not.
+        assert!(!verify_frame_checksum(&declared("sum8", 0), &frames)
+            .unwrap()
+            .holds());
+    }
+
+    /// Frames too short to carry the checksum are not evidence against it — the
+    /// bare-acknowledgement case that has bitten this engine before.
+    #[test]
+    fn frames_too_short_are_excluded_rather_than_counted_as_failures() {
+        let mut frames = summed(10, 0);
+        frames.push(vec![0xF8]);
+
+        let result = verify_frame_checksum(&declared("sum8", 0), &frames).unwrap();
+        assert_eq!(result.total, 10, "the acknowledgement was counted");
+        assert!(result.holds());
+    }
+
+    /// The case a verifier reading only the algorithm id gets *wrong*, rather
+    /// than declining: a sum with a constant offset is stored as `sum8`, so
+    /// reproducing it from the id alone yields a different byte and calls a
+    /// correct declaration completely broken.
+    #[test]
+    fn a_sum_with_an_offset_is_verified_by_its_parameters_not_its_id() {
+        let frames: Vec<Vec<u8>> = (0..20u8)
+            .map(|i| {
+                let mut f = vec![0x10, i, i.wrapping_mul(7)];
+                f.push(wiretap_checksum::algorithms::sum8_checksum(&f).wrapping_add(0xA5));
+                f
+            })
+            .collect();
+
+        let solved = wiretap_checksum::SolvedChecksum {
+            target: wiretap_checksum::SolveTarget {
+                position: -1,
+                byte_length: 1,
+                big_endian: true,
+                calc_start_byte: 0,
+                calc_end_byte: -1,
+            },
+            specification: wiretap_checksum::ChecksumSpecification::Additive {
+                op: wiretap_checksum::AdditiveOp::Sum,
+                offset: 0xA5,
+            },
+            sample_count: 20,
+            excluded_count: 0,
+            equivalent_ranges: Vec::new(),
+        };
+
+        let declared = FrameChecksum::from_solved(Some("cs".into()), &solved);
+        assert_eq!(declared.algorithm, "sum8", "stored under the named id");
+        assert_eq!(declared.parameters.offset, Some(0xA5));
+
+        let result = verify_frame_checksum(&declared, &frames).unwrap();
+        assert!(
+            result.holds(),
+            "correct declaration reported broken: {result:?}"
+        );
+    }
+
+    /// The conversion has to survive both directions, or a saved answer is not
+    /// the answer that was found.
+    #[test]
+    fn a_solved_configuration_round_trips_through_the_catalogue_shape() {
+        let specifications = [
+            wiretap_checksum::ChecksumSpecification::Additive {
+                op: wiretap_checksum::AdditiveOp::NegatedSum,
+                offset: 0x11,
+            },
+            wiretap_checksum::ChecksumSpecification::Crc(wiretap_checksum::CrcParameters {
+                width: 8,
+                polynomial: 0x4D,
+                reflect_in: true,
+                reflect_out: false,
+                init: 0,
+                xor_out: 0xB7,
+                well_known: false,
+                alternatives: Vec::new(),
+            }),
+        ];
+
+        for specification in specifications {
+            let solved = wiretap_checksum::SolvedChecksum {
+                target: wiretap_checksum::SolveTarget {
+                    position: -1,
+                    byte_length: 1,
+                    big_endian: true,
+                    calc_start_byte: 1,
+                    calc_end_byte: -1,
+                },
+                specification: specification.clone(),
+                sample_count: 20,
+                excluded_count: 0,
+                equivalent_ranges: Vec::new(),
+            };
+            let declared = FrameChecksum::from_solved(None, &solved);
+            assert_eq!(
+                declared.specification(),
+                Some(specification.clone()),
+                "{} did not round trip",
+                declared.algorithm
+            );
+            assert_eq!(declared.start_byte, -1);
+            assert_eq!(declared.calc_start_byte, 1);
+        }
+    }
+
+    /// A solved CRC names no algorithm the sweep knows, so this declines rather
+    /// than reporting a failure it did not measure.
+    #[test]
+    fn a_custom_polynomial_is_declined_not_failed() {
+        let incoherent = declared(wiretap_checksum::CRC_CUSTOM, 0);
+        assert!(verify_frame_checksum(&incoherent, &[vec![1, 2, 3]]).is_none());
+    }
+
+    /// The list is the engine's, not a transcription of it.
+    #[test]
+    fn every_named_algorithm_is_accepted_by_the_validator() {
+        let ids = checksum_algorithm_ids();
+        for algorithm in wiretap_checksum::ALL_ALGORITHMS {
+            assert!(ids.contains(&algorithm.as_str()), "{algorithm:?} rejected");
+        }
+        for id in [wiretap_checksum::CRC_CUSTOM, wiretap_checksum::SUM8_NEGATED] {
+            assert!(ids.contains(&id), "{id} rejected");
+        }
     }
 }
