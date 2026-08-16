@@ -10,6 +10,11 @@ A Cargo workspace of related **WireTAP** Rust libraries. Each crate lives under
 | --- | --- |
 | [`wiretap-catalog`](crates/wiretap-catalog) | Parser, validator, decoder, and writer for WireTAP-format device catalogues (TOML) across CAN, Serial, and Modbus. |
 | [`wiretap-decode`](crates/wiretap-decode) | Protocol-agnostic decode core — bit extraction, 16-bit word-swap, exact `Decimal` scaling, and value formatting. `wiretap-catalog` builds on it; it has no dependency on the catalogue model. |
+| [`wiretap-checksum`](crates/wiretap-checksum) | Checksum algorithms (XOR, Sum8, CRC-8/16) and the engine that works out which one a link is using — a scored sweep of the named algorithms, plus solvers that recover an arbitrary CRC polynomial or an offset sum outright. |
+
+`wiretap-catalog` is the top of the stack; the other two are its primitives and
+have no dependency on the catalogue model. Read a crate's own README for what it
+does and why it does it that way.
 
 ## Develop
 
@@ -28,13 +33,23 @@ Releases go through [`cargo-release`](https://github.com/crate-ci/cargo-release)
 (config in [`release.toml`](release.toml)):
 
 ```sh
-cargo release -p wiretap-catalog patch        # dry-run preview
-cargo release -p wiretap-catalog patch -x     # --execute: bump, commit, tag, push
+cargo release patch        # dry-run preview
+cargo release minor -x     # --execute: bump every crate, commit, tag, push
 ```
 
-The pre-release hook runs the CI gate, so a tag is never cut from a red tree.
+The whole workspace is versioned and released **as one unit** — `shared-version
+= true`, so every crate carries the same number and one `vX.Y.Z` tag covers them
+all. There is no per-crate release. Releases run from `main` only, and the
+pre-release hook runs the CI gate, so a tag is never cut from a red tree.
 
-`wiretap-catalog` depends on `wiretap-decode` by path, so the catalogue release
-tag's tree already contains the matching `wiretap-decode` source — consumers
-pin only the `wiretap-catalog` tag and the path dependency resolves inside that
-checkout. `wiretap-decode` is not tagged separately.
+Crates depend on each other by path, so a tag's tree already contains every
+crate's matching source. A consumer pins whichever crate it needs at that tag
+and the path dependencies resolve inside the checkout:
+
+```toml
+wiretap-catalog = { git = "ssh://git@github.com/Wired-Square/wiretap-lib-rs.git", tag = "vX.Y.Z" }
+```
+
+(Left as a placeholder deliberately — `pre-release-replacements` rewrites the
+pin in each *crate's* README, but the workspace root is not a package, so a real
+version here would go stale on the next release.)
