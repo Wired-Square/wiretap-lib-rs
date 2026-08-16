@@ -6,6 +6,17 @@
 
 use serde::Serialize;
 
+/// Below this many samples, one repeated value is not yet evidence of padding.
+///
+/// Deliberately private: both halves of the engine ask "is this column
+/// constant" and they used to answer differently — identification rejected on
+/// the first duplicate while scoring held out for eight samples, so a
+/// thinly-sampled column could be called padding in the evidence panel and
+/// swept as a candidate in the same result. [`ColumnStats::padding_value`] is
+/// the only way to ask, and exporting the threshold would only invite a caller
+/// to re-derive the check around it.
+const CONSTANT_COLUMN_MIN_SAMPLES: usize = 8;
+
 /// What one byte column does across the sample.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,13 +40,26 @@ pub struct ColumnStats {
 
 impl ColumnStats {
     /// Distinct values against the most this column could have shown, which is
-    /// bounded by the sample count as well as by the 256 a byte can hold.
-    pub fn distinct_ratio(&self) -> f64 {
-        let ceiling = self.sample_count.min(256);
+    /// bounded by the sample count as well as by the `span` a checksum of this
+    /// width could reach — 256 for one byte, 65536 for two.
+    pub fn distinct_ratio_over(&self, span: usize) -> f64 {
+        let ceiling = self.sample_count.min(span);
         if ceiling == 0 {
             return 0.0;
         }
         self.distinct_values as f64 / ceiling as f64
+    }
+
+    /// Distinct values against the most a single byte column could have shown.
+    pub fn distinct_ratio(&self) -> f64 {
+        self.distinct_ratio_over(256)
+    }
+
+    /// The value this column is padded with, if enough samples agree to call it
+    /// padding rather than a coincidence.
+    pub fn padding_value(&self) -> Option<u8> {
+        self.constant_value
+            .filter(|_| self.sample_count >= CONSTANT_COLUMN_MIN_SAMPLES)
     }
 }
 
@@ -193,5 +217,30 @@ mod tests {
 
         // Four distinct in four samples is saturated, not 4/256.
         assert!(approx(last.distinct_ratio(), 1.0));
+    }
+
+    /// A two-byte checksum reaches 65536 values, so the same column is far less
+    /// saturated when judged as half of one.
+    #[test]
+    fn distinct_ratio_widens_with_the_span_asked_about() {
+        let payloads: Vec<Vec<u8>> = (0..=255u8).map(|i| vec![i]).collect();
+        let last = &analyse_columns(&payloads)[0];
+
+        assert!(approx(last.distinct_ratio(), 1.0));
+        assert!(approx(last.distinct_ratio_over(65536), 1.0));
+    }
+
+    /// One repeated value across three frames is a coincidence; across forty it
+    /// is padding. Both halves of the engine now draw the line here.
+    #[test]
+    fn a_thinly_sampled_constant_column_is_not_yet_padding() {
+        let thin: Vec<Vec<u8>> = (0..3u8).map(|i| vec![i, 0x00]).collect();
+        let last = analyse_columns(&thin).into_iter().next().unwrap();
+        assert_eq!(last.constant_value, Some(0x00));
+        assert_eq!(last.padding_value(), None);
+
+        let plenty: Vec<Vec<u8>> = (0..40u8).map(|i| vec![i, 0x00]).collect();
+        let last = analyse_columns(&plenty).into_iter().next().unwrap();
+        assert_eq!(last.padding_value(), Some(0x00));
     }
 }

@@ -10,6 +10,11 @@ does.
 - **frame addressing** — `resolve_byte_index`, `extract_checksum`,
   `validate_checksum`; offsets are end-relative, so mixed frame lengths on one
   link line up
+- **columns** — `analyse_columns`, the per-byte-column statistics every other
+  part rests on. They live here, beside the addressing they are indexed by,
+  because both the sweep and the identification pass upstream need them
+- **calculation ranges** — `calc_ranges`, the one candidate space for *what a
+  checksum is calculated over*, shared by the sweep and the solver
 - **sweep** — `ChecksumSpec` (algorithm × position × calc range × endianness)
   and `sweep_specs`, which groups specs sharing a calculation so each CRC runs
   once per frame rather than once per spec
@@ -55,6 +60,23 @@ checksum**, however perfectly XOR-over-zeros "matches" it. And feasibility is
 judged against the **longest** frame, not the shortest — `sweep_specs` already
 excludes frames that individually cannot carry a spec, so gating the whole
 search on the shortest lets one bare acknowledgement empty the space.
+
+## One range space, or the solver searches less than the sweep
+
+`calc_ranges` exists because these two halves disagreed. The sweep tried starts
+`{0, 1, 2}`; the solver calculated from byte 0 and nowhere else. So a checksum
+over `1..n` — a leading type or id byte excluded, which is exactly what the
+Tesla HPWC sum does — could be *matched* and never *solved*, and ticking
+"search custom polynomials" on such a frame reported nothing with no knob to
+turn. A solve is microseconds; there was never a cost reason for the narrower
+space, only an accident of where the constant lived.
+
+The flip side is that widening it makes duplicates, and a caller must fold them.
+A constant range contributes a constant, which a sum absorbs into its offset and
+a CRC into its residue — so when the excluded bytes never change, *every* start
+solves, with a different offset each. Those are one answer written several ways.
+Report the widest and carry the rest as equivalents; when only one range solves,
+the excluded bytes did move, and that answer is the real one.
 
 Explanations cross as `ChecksumNote { code, values }` rather than English, so
 the caller translates.

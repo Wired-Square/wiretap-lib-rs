@@ -31,9 +31,8 @@
 //! maximum, and not a checksum among them.
 
 use serde::Serialize;
-use wiretap_checksum::{SolveTarget, MAX_SAMPLES};
-
-use crate::columns::{analyse_columns, ColumnStats};
+use wiretap_checksum::columns::{analyse_columns, ColumnStats};
+use wiretap_checksum::{calc_ranges, SolveTarget, MAX_SAMPLES};
 
 /// Below this many payload pairs, the conditional rates are noise.
 const MIN_TRANSITIONS: usize = 8;
@@ -119,7 +118,8 @@ fn evaluate(
         rejected: None,
     };
 
-    if column.constant_value.is_some() {
+    // Padding, not a checksum.
+    if column.padding_value().is_some() {
         evidence.rejected = Some(Rejection::Constant);
         return evidence;
     }
@@ -214,7 +214,20 @@ pub fn checksum_evidence(payloads: &[Vec<u8>]) -> Vec<ChecksumEvidence> {
         .take(MAX_SAMPLES)
         .cloned()
         .collect();
+    let columns = analyse_columns(&sample);
+    checksum_evidence_with_columns(&sample, &columns)
+}
 
+/// [`checksum_evidence`] for a caller that has already profiled the columns and
+/// already chosen its sample.
+///
+/// The sweep needs the same columns, so handing them over is one pass instead of
+/// two and — the part that matters — leaves one verdict per byte rather than two
+/// that can disagree.
+pub fn checksum_evidence_with_columns(
+    sample: &[Vec<u8>],
+    columns: &[ColumnStats],
+) -> Vec<ChecksumEvidence> {
     let distinct_payloads = {
         let mut seen: Vec<&[u8]> = sample.iter().map(|p| p.as_slice()).collect();
         seen.sort_unstable();
@@ -222,10 +235,11 @@ pub fn checksum_evidence(payloads: &[Vec<u8>]) -> Vec<ChecksumEvidence> {
         seen.len()
     };
 
-    analyse_columns(&sample)
+    columns
         .iter()
-        .enumerate()
-        .map(|(i, column)| evaluate(column, &sample, i + 1, distinct_payloads))
+        // Depth comes off the column's own position rather than its index, so
+        // the slice need not arrive in any particular order.
+        .map(|column| evaluate(column, sample, -column.position as usize, distinct_payloads))
         .collect()
 }
 
@@ -233,8 +247,15 @@ pub fn checksum_evidence(payloads: &[Vec<u8>]) -> Vec<ChecksumEvidence> {
 ///
 /// One target per surviving column, plus the two-byte target that column would
 /// form with the byte before it — a 16-bit checksum shows up as two adjacent
-/// responsive columns.
-pub fn solve_targets(evidence: &[ChecksumEvidence], min_likeness: u8) -> Vec<SolveTarget> {
+/// responsive columns. Each is crossed with every range [`calc_ranges`] offers,
+/// so the solver searches the same calculation ranges the sweep does; see that
+/// function for why it must, and for why the caller has to fold the duplicate
+/// solutions the cross product produces.
+pub fn solve_targets(
+    evidence: &[ChecksumEvidence],
+    columns: &[ColumnStats],
+    min_likeness: u8,
+) -> Vec<SolveTarget> {
     let mut ranked: Vec<&ChecksumEvidence> = evidence
         .iter()
         .filter(|e| e.is_candidate() && e.likeness >= min_likeness)
@@ -243,13 +264,7 @@ pub fn solve_targets(evidence: &[ChecksumEvidence], min_likeness: u8) -> Vec<Sol
 
     let mut targets = Vec::new();
     for candidate in ranked {
-        targets.push(SolveTarget {
-            position: candidate.position,
-            byte_length: 1,
-            big_endian: true,
-            calc_start_byte: 0,
-            calc_end_byte: candidate.position,
-        });
+        let mut geometries: Vec<(i32, usize)> = vec![(candidate.position, 1)];
 
         // A 16-bit checksum occupies this column and the one before it, so the
         // pair is only worth trying when that neighbour also survived.
@@ -258,14 +273,28 @@ pub fn solve_targets(evidence: &[ChecksumEvidence], min_likeness: u8) -> Vec<Sol
             .iter()
             .any(|e| e.position == neighbour && e.is_candidate())
         {
-            for big_endian in [false, true] {
-                targets.push(SolveTarget {
-                    position: neighbour,
-                    byte_length: 2,
-                    big_endian,
-                    calc_start_byte: 0,
-                    calc_end_byte: neighbour,
-                });
+            geometries.push((neighbour, 2));
+        }
+
+        for (position, byte_length) in geometries {
+            // Endianness only means something for a multi-byte checksum, the
+            // same rule `build_checksum_specs` applies to the sweep.
+            let endiannesses: &[bool] = if byte_length == 2 {
+                &[false, true]
+            } else {
+                &[true]
+            };
+
+            for range in calc_ranges(position, columns, &[]) {
+                for &big_endian in endiannesses {
+                    targets.push(SolveTarget {
+                        position,
+                        byte_length,
+                        big_endian,
+                        calc_start_byte: range.calc_start_byte,
+                        calc_end_byte: range.calc_end_byte,
+                    });
+                }
             }
         }
     }
@@ -276,10 +305,18 @@ pub fn solve_targets(evidence: &[ChecksumEvidence], min_likeness: u8) -> Vec<Sol
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use wiretap_checksum::algorithms::{crc8_checksum, sum8_checksum};
 
     fn at(evidence: &[ChecksumEvidence], position: i32) -> &ChecksumEvidence {
         evidence.iter().find(|e| e.position == position).unwrap()
+    }
+
+    /// The targets a caller would hand the solver for these payloads.
+    fn targets(payloads: &[Vec<u8>], min_likeness: u8) -> Vec<SolveTarget> {
+        let columns = analyse_columns(payloads);
+        let evidence = checksum_evidence_with_columns(payloads, &columns);
+        solve_targets(&evidence, &columns, min_likeness)
     }
 
     /// Independently varying data with a real checksum appended.
@@ -395,10 +432,11 @@ mod tests {
     /// checksum must always reach the solver.
     #[test]
     fn the_real_checksum_column_is_never_filtered_out() {
-        let evidence = checksum_evidence(&signed(120, crc8_checksum));
+        let payloads = signed(120, crc8_checksum);
+        let evidence = checksum_evidence(&payloads);
         assert!(at(&evidence, -1).is_candidate(), "{:?}", at(&evidence, -1));
 
-        let targets = solve_targets(&evidence, 50);
+        let targets = targets(&payloads, 50);
         assert!(
             targets
                 .iter()
@@ -422,9 +460,51 @@ mod tests {
     #[test]
     fn a_rejected_bus_yields_no_targets_at_all() {
         let payloads: Vec<Vec<u8>> = (0..60u8).map(|i| vec![0x10, 0x20, 0x30, i]).collect();
-        let evidence = checksum_evidence(&payloads);
+        assert!(targets(&payloads, 50).is_empty());
+    }
 
-        assert!(solve_targets(&evidence, 50).is_empty());
+    /// The gap this milestone closes. A leading type byte that *varies* is not
+    /// absorbed into an offset, so only the range that excludes it can solve —
+    /// and until the solver was offered that range, ticking "search custom
+    /// polynomials" on this frame reported nothing at all.
+    #[test]
+    fn the_solver_is_offered_a_range_that_excludes_a_leading_type_byte() {
+        let payloads: Vec<Vec<u8>> = (0..120u32)
+            .map(|i| {
+                let mut body = vec![
+                    (i % 7) as u8,
+                    (i.wrapping_mul(37) ^ 0x5A) as u8,
+                    (i.wrapping_mul(211)) as u8,
+                    (i.wrapping_mul(7) ^ 0xF0) as u8,
+                ];
+                let checksum = sum8_checksum(&body[1..]);
+                body.push(checksum);
+                body
+            })
+            .collect();
+
+        let offered = targets(&payloads, 50);
+        assert!(
+            offered
+                .iter()
+                .any(|t| t.position == -1 && t.byte_length == 1 && t.calc_start_byte == 1),
+            "no target skips the type byte: {offered:?}"
+        );
+    }
+
+    /// Every start the sweep tries, the solver now tries too. Nothing about the
+    /// checksum's own geometry should decide which calculation ranges are on
+    /// offer — that was the asymmetry.
+    #[test]
+    fn the_solver_sees_the_same_starts_the_sweep_does() {
+        let payloads = signed(120, crc8_checksum);
+        let starts: BTreeSet<i32> = targets(&payloads, 50)
+            .iter()
+            .filter(|t| t.position == -1)
+            .map(|t| t.calc_start_byte)
+            .collect();
+
+        assert_eq!(starts, BTreeSet::from([0, 1, 2]));
     }
 
     /// A 16-bit checksum leaves two adjacent responsive columns, and the pair is
@@ -442,10 +522,10 @@ mod tests {
             .collect();
 
         let evidence = checksum_evidence(&payloads);
-        let targets = solve_targets(&evidence, 40);
+        let offered = targets(&payloads, 40);
 
         assert!(
-            targets
+            offered
                 .iter()
                 .any(|t| t.byte_length == 2 && t.position == -2),
             "no two-byte target: {evidence:?}"

@@ -1,7 +1,13 @@
 # wiretap-analysis
 
-Payload analysis for WireTAP frames: per-byte-column statistics, and the
-identification pass that says which bytes are worth solving as a checksum.
+Payload analysis for WireTAP frames: the identification pass that says which
+bytes are worth solving as a checksum, and the geometries to solve them over.
+
+Per-byte-column statistics live in
+[`wiretap-checksum`](../wiretap-checksum), beside the end-relative addressing
+they are indexed by, and are re-exported here. They used to exist twice, once on
+each side of this boundary, and the two copies had already drifted into
+disagreeing about when a column counts as padding.
 
 The split from [`wiretap-checksum`](../wiretap-checksum) is a real seam. That
 crate answers *what algorithm is this byte*. This one answers the prior and
@@ -35,6 +41,13 @@ Identification **narrows** the search; it does not decide the answer. Where ever
 field moves on every frame, a data byte is as responsive as a checksum and both
 survive. The property that matters is the other direction — the real checksum
 must never be filtered out — and that is what the tests pin.
+
+`solve_targets` follows the same rule about ranges. Each surviving column is
+crossed with every calculation range `wiretap-checksum::calc_ranges` offers,
+rather than assuming the calculation starts at byte 0 — so a checksum that skips
+a leading type byte reaches the solver instead of only the sweep. Several of
+those ranges will often solve the same frame, and folding them back into one
+answer is the caller's job; see that crate's README for why.
 
 Measured on a 62-id Sungrow BMS capture: 496 byte columns reduce to 27
 candidates across 5 frame ids in 650µs, and solving all of those exhaustively

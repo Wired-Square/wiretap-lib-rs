@@ -4,6 +4,9 @@
 //!   Bytes in, value out; nothing here knows about frames.
 //! - [`frame`] — end-relative byte addressing, reading a stored checksum out of
 //!   a frame, and validating one against the other.
+//! - [`columns`] — per-byte-column statistics. The structural evidence both the
+//!   sweep and the identification pass upstream rest on, so it lives here with
+//!   the addressing it is indexed by rather than in either caller.
 //! - [`spec`] — [`ChecksumSpec`], one point in the candidate space, and the
 //!   grouped sweep that measures many specs against many frames.
 //! - [`detect`] — the engine: build the candidate space from column priors,
@@ -17,6 +20,7 @@
 //! case that breaks length assumptions, and it is a real capture, not a corner.
 
 pub mod algorithms;
+pub mod columns;
 pub mod detect;
 pub mod frame;
 pub mod notes;
@@ -31,10 +35,10 @@ pub use algorithms::{
     calculate_checksum_simple, crc16_parameterised, crc8_parameterised, ChecksumAlgorithm,
     ALL_ALGORITHMS,
 };
+pub use columns::{analyse_columns, ColumnStats};
 pub use detect::{
-    analyse_tail_columns, build_checksum_specs, detect_checksum, CalcRange, ChecksumCandidate,
-    ChecksumColumnStat, ChecksumDetectionOptions, ChecksumDetectionResult, MAX_SAMPLES,
-    MIN_TAIL_DEPTH,
+    build_checksum_specs, calc_ranges, detect_checksum, detect_checksum_with_columns, CalcRange,
+    ChecksumCandidate, ChecksumDetectionOptions, ChecksumDetectionResult, MAX_SAMPLES,
 };
 pub use frame::{
     calculate_checksum, extract_checksum, resolve_byte_index, validate_checksum,

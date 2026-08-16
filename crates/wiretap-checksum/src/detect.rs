@@ -11,17 +11,16 @@ use std::collections::{BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::algorithms::{ChecksumAlgorithm, ALL_ALGORITHMS};
+use crate::columns::{analyse_columns, ColumnStats};
 use crate::frame::resolve_byte_index;
 use crate::notes::ChecksumNote;
 use crate::spec::{sweep_specs, ChecksumSpec};
 
-/// How many end-relative byte columns to profile, at minimum. The priors have to
-/// reach every position being swept — a candidate past the profiled depth would
-/// silently skip the constant-column rejection the whole design rests on.
-pub const MIN_TAIL_DEPTH: i32 = 4;
-
-/// Below this many samples, a constant column is not yet evidence of padding.
-const CONSTANT_COLUMN_MIN_SAMPLES: usize = 8;
+/// How many end-relative byte columns the result reports on, at minimum.
+/// Columns themselves are profiled to the longest payload — the calculation
+/// ranges need to see a run of padding wherever it starts — but "the last few
+/// bytes are 0x00" stops being one useful fact if it reaches the whole frame.
+const MIN_TAIL_DEPTH: i32 = 4;
 
 /// Cap on the returned candidate list.
 const MAX_CANDIDATES: usize = 12;
@@ -59,20 +58,6 @@ impl Default for ChecksumDetectionOptions {
     }
 }
 
-/// What one end-relative byte column looks like across the sample. This is the
-/// structural evidence behind the priors: a column that never changes cannot be
-/// a checksum, and one that takes many values probably is.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ChecksumColumnStat {
-    /// Negative index, e.g. -1 for the last byte.
-    pub position: i32,
-    pub distinct_values: usize,
-    /// Set when the column holds one value across every sampled frame.
-    pub constant_value: Option<u8>,
-    pub sample_count: usize,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CalcRange {
@@ -107,52 +92,82 @@ pub struct ChecksumCandidate {
 pub struct ChecksumDetectionResult {
     pub candidates: Vec<ChecksumCandidate>,
     pub best_candidate: Option<ChecksumCandidate>,
-    pub tail_columns: Vec<ChecksumColumnStat>,
+    pub tail_columns: Vec<ColumnStats>,
     /// Result-level explanation, including why nothing was found.
     pub notes: Vec<ChecksumNote>,
 }
 
-/// Profile the last `depth` byte columns (at least [`MIN_TAIL_DEPTH`]),
-/// end-relative so frames of different lengths line up. Frames too short for a
-/// column do not contribute.
-pub fn analyse_tail_columns(frames: &[Vec<u8>], depth: i32) -> Vec<ChecksumColumnStat> {
-    (1..=depth.max(MIN_TAIL_DEPTH))
-        .filter_map(|k| {
-            let mut values = BTreeSet::new();
-            let mut sample_count = 0usize;
-            for frame in frames {
-                if frame.len() < k as usize {
-                    continue;
-                }
-                values.insert(frame[frame.len() - k as usize]);
-                sample_count += 1;
-            }
-            (sample_count > 0).then(|| ChecksumColumnStat {
-                position: -k,
-                distinct_values: values.len(),
-                constant_value: (values.len() == 1).then(|| *values.iter().next().unwrap()),
-                sample_count,
-            })
-        })
-        .collect()
-}
-
-fn column_at(columns: &[ChecksumColumnStat], position: i32) -> Option<&ChecksumColumnStat> {
+fn column_at(columns: &[ColumnStats], position: i32) -> Option<&ColumnStats> {
     columns.iter().find(|c| c.position == position)
 }
 
-/// Number of constant columns sitting immediately before `position`.
-fn constant_run_before(position: i32, columns: &[ChecksumColumnStat]) -> i32 {
+/// Number of padding columns sitting immediately before `position`.
+fn constant_run_before(position: i32, columns: &[ColumnStats]) -> i32 {
     let mut run = 0;
     let mut p = position - 1;
-    while let Some(column) = column_at(columns, p) {
-        if column.constant_value.is_none() {
-            break;
-        }
+    while column_at(columns, p).is_some_and(|c| c.padding_value().is_some()) {
         run += 1;
         p -= 1;
     }
     run
+}
+
+/// The calculation ranges worth trying for a checksum at `position`.
+///
+/// This is the candidate space both halves of the engine search, and it exists
+/// as one function because they used to disagree. The sweep tried these starts;
+/// the solver hardcoded `0` — so a checksum over `1..n`, which is what a leading
+/// type or id byte excluded from the calculation looks like and what the Tesla
+/// HPWC sum actually does, could be *matched* but never *solved*. Ticking
+/// "search custom polynomials" on such a frame reported nothing, with no knob to
+/// turn.
+///
+/// **Starts** are 0, 1, 2 and any declared header boundary. `1` and `2` are not
+/// arbitrary: a one- or two-byte header excluded from the calculation is the
+/// common shape, and it is the one a declared boundary cannot express when the
+/// field starts at byte 0.
+///
+/// **Ends** are the checksum's own position, and — when a run of padding sits
+/// immediately before it — the position in front of that run. Both are offered
+/// because a constant range contributes a constant, so including or excluding
+/// it changes the offset and never the algorithm; the data cannot distinguish
+/// them and the caller should not pretend otherwise.
+pub fn calc_ranges(
+    position: i32,
+    columns: &[ColumnStats],
+    header_boundaries: &[i32],
+) -> Vec<CalcRange> {
+    // `analyse_columns` emits one column per byte of the longest payload, so the
+    // count is that length. Deriving it here rather than taking it as an
+    // argument is the point: the two callers reached the same number by
+    // different routes, which is the class of disagreement this function exists
+    // to remove.
+    let max_length = columns.len();
+
+    let starts: BTreeSet<i32> = [0, 1, 2]
+        .iter()
+        .chain(header_boundaries.iter())
+        .copied()
+        .filter(|s| *s >= 0)
+        .collect();
+
+    let run = constant_run_before(position, columns);
+
+    std::iter::once(position)
+        .chain((run > 0).then(|| position - run))
+        .flat_map(|calc_end_byte| {
+            starts.iter().map(move |calc_start_byte| CalcRange {
+                calc_start_byte: *calc_start_byte,
+                calc_end_byte,
+            })
+        })
+        // Degenerate for every frame: an end-relative range is at its widest in
+        // the longest frame, so if even that one has nothing to calculate over,
+        // none of them do.
+        .filter(|range| {
+            resolve_byte_index(range.calc_end_byte, max_length) > range.calc_start_byte as usize
+        })
+        .collect()
 }
 
 /// Enumerate the configurations worth testing.
@@ -163,7 +178,7 @@ fn constant_run_before(position: i32, columns: &[ChecksumColumnStat]) -> i32 {
 pub fn build_checksum_specs(
     frames: &[Vec<u8>],
     options: &ChecksumDetectionOptions,
-    columns: &[ChecksumColumnStat],
+    columns: &[ColumnStats],
 ) -> Vec<ChecksumSpec> {
     // The longest frame, not the shortest. Feasibility here asks "can any frame
     // carry this configuration", because `sweep_specs` already excludes the
@@ -172,30 +187,11 @@ pub fn build_checksum_specs(
     // the entire search space.
     let max_length = frames.iter().map(|f| f.len()).max().unwrap_or(0);
 
-    // `1` is not arbitrary: a leading type/ID byte excluded from the calculation
-    // is a common shape, and it is the one the declared-header hints cannot
-    // supply when a field starts at byte 0. Starts that overrun the frame are
-    // left to the degenerate-range check below rather than filtered here.
-    let calc_starts: BTreeSet<i32> = [0, 1, 2]
-        .iter()
-        .chain(options.header_boundaries.iter())
-        .copied()
-        .filter(|s| *s >= 0)
-        .collect();
-
-    // Runs are per position, and every algorithm at a position shares them.
-    let calc_ends: HashMap<i32, Vec<i32>> = options
+    // Ranges are per position, and every algorithm at a position shares them.
+    let ranges: HashMap<i32, Vec<CalcRange>> = options
         .positions
         .iter()
-        .map(|p| {
-            let run = constant_run_before(*p, columns);
-            let ends: Vec<i32> = if run > 0 {
-                vec![*p, *p - run]
-            } else {
-                vec![*p]
-            };
-            (*p, ends)
-        })
+        .map(|p| (*p, calc_ranges(*p, columns, &options.header_boundaries)))
         .collect();
 
     let mut specs = Vec::new();
@@ -223,24 +219,16 @@ pub fn build_checksum_specs(
                 continue;
             }
 
-            for calc_end_byte in &calc_ends[position] {
-                for calc_start_byte in &calc_starts {
-                    // Degenerate for every frame: an end-relative range is at
-                    // its widest in the longest frame, so if even that one has
-                    // nothing to calculate over, none of them do.
-                    if resolve_byte_index(*calc_end_byte, max_length) <= *calc_start_byte as usize {
-                        continue;
-                    }
-                    for big_endian in endiannesses {
-                        specs.push(ChecksumSpec {
-                            algorithm,
-                            position: *position,
-                            byte_length,
-                            big_endian: *big_endian,
-                            calc_start_byte: *calc_start_byte,
-                            calc_end_byte: *calc_end_byte,
-                        });
-                    }
+            for range in &ranges[position] {
+                for big_endian in endiannesses {
+                    specs.push(ChecksumSpec {
+                        algorithm,
+                        position: *position,
+                        byte_length,
+                        big_endian: *big_endian,
+                        calc_start_byte: range.calc_start_byte,
+                        calc_end_byte: range.calc_end_byte,
+                    });
                 }
             }
         }
@@ -250,7 +238,7 @@ pub fn build_checksum_specs(
 }
 
 struct ScoringContext<'a> {
-    columns: &'a [ChecksumColumnStat],
+    columns: &'a [ColumnStats],
     header_boundaries: &'a [i32],
     frames: &'a [Vec<u8>],
 }
@@ -287,10 +275,8 @@ fn score_candidate(
     let column = column_at(ctx.columns, spec.position);
 
     // A constant column is padding, not a checksum — however well it matches.
-    if let Some(column) = column {
-        if column.constant_value.is_some() && column.sample_count >= CONSTANT_COLUMN_MIN_SAMPLES {
-            return None;
-        }
+    if column.is_some_and(|c| c.padding_value().is_some()) {
+        return None;
     }
 
     let mut notes: Vec<ChecksumNote> = Vec::new();
@@ -339,10 +325,8 @@ fn score_candidate(
     // A real checksum column varies. This is the same class of check as the
     // 0xC0-frequency test in the framing detector: cheap, structural, decisive.
     if let Some(column) = column {
-        let span = column
-            .sample_count
-            .min(if spec.byte_length == 2 { 65536 } else { 256 });
-        let distinct_ratio = column.distinct_values as f64 / span as f64;
+        let distinct_ratio =
+            column.distinct_ratio_over(if spec.byte_length == 2 { 65536 } else { 256 });
         if distinct_ratio >= 0.5 {
             score += 15;
             notes.push(ChecksumNote::new(
@@ -377,7 +361,7 @@ fn score_candidate(
 
     if spec.calc_end_byte < spec.position {
         if let Some(value) =
-            column_at(ctx.columns, spec.calc_end_byte).and_then(|c| c.constant_value)
+            column_at(ctx.columns, spec.calc_end_byte).and_then(|c| c.padding_value())
         {
             score += 5;
             notes.push(ChecksumNote::new(
@@ -400,7 +384,7 @@ fn score_candidate(
         } else {
             spec.position + 1
         };
-        if column_at(ctx.columns, high).is_some_and(|c| c.constant_value.is_some()) {
+        if column_at(ctx.columns, high).is_some_and(|c| c.padding_value().is_some()) {
             score -= 10;
             notes.push(ChecksumNote::new("highByteConstant", &[]));
         }
@@ -468,7 +452,7 @@ fn collapse_equivalent(mut candidates: Vec<ChecksumCandidate>) -> Vec<ChecksumCa
 /// Say why the search came up empty. A silent 0% reads as "your data is wrong";
 /// naming what was looked at and what the tail actually looks like points at the
 /// next thing to try.
-fn explain_no_candidates(last: &ChecksumColumnStat, frame_count: usize) -> ChecksumNote {
+fn explain_no_candidates(last: &ColumnStats, frame_count: usize) -> ChecksumNote {
     match last.constant_value {
         Some(value) => ChecksumNote::new(
             "noneLastByteConstant",
@@ -492,26 +476,30 @@ fn explain_no_candidates(last: &ChecksumColumnStat, frame_count: usize) -> Check
 /// An all-zero frame profiles four constant columns and produced four lines
 /// saying the same thing in different words. Only columns sharing a value join a
 /// run — `0x00` beside `0xFF` is two facts, not one.
-fn constant_padding_notes(columns: &[ChecksumColumnStat]) -> Vec<ChecksumNote> {
-    let padding: Vec<&ChecksumColumnStat> = columns
+///
+/// Scoped to `depth` because columns are now profiled to the whole payload: on
+/// an all-constant frame id — which a real bus has plenty of — reporting every
+/// column would turn one useful observation about the tail into eight lines
+/// restating that the frame does not change.
+fn constant_padding_notes(columns: &[ColumnStats]) -> Vec<ChecksumNote> {
+    let padding: Vec<(i32, u8)> = columns
         .iter()
-        .filter(|c| c.sample_count >= CONSTANT_COLUMN_MIN_SAMPLES)
+        .filter_map(|c| Some((c.position, c.padding_value()?)))
         .collect();
 
     let mut notes = Vec::new();
     let mut index = 0;
 
     while index < padding.len() {
-        let Some(value) = padding[index].constant_value else {
-            index += 1;
-            continue;
-        };
+        let (position, value) = padding[index];
 
-        // Columns arrive -1, -2, -3…, so a run is contiguous in this order.
+        // Columns arrive -1, -2, -3…, so a run is contiguous in this order. A
+        // column that failed the padding test is simply absent, which breaks
+        // the run by failing this adjacency check.
         let start = index;
         while index + 1 < padding.len()
-            && padding[index + 1].constant_value == Some(value)
-            && padding[index + 1].position == padding[index].position - 1
+            && padding[index + 1].1 == value
+            && padding[index + 1].0 == padding[index].0 - 1
         {
             index += 1;
         }
@@ -521,18 +509,15 @@ fn constant_padding_notes(columns: &[ChecksumColumnStat]) -> Vec<ChecksumNote> {
             ChecksumNote::new(
                 "constantPaddingRun",
                 &[
-                    ("from", padding[index].position.into()),
-                    ("to", padding[start].position.into()),
+                    ("from", padding[index].0.into()),
+                    ("to", position.into()),
                     ("value", hex.into()),
                 ],
             )
         } else {
             ChecksumNote::new(
                 "constantPadding",
-                &[
-                    ("position", padding[start].position.into()),
-                    ("value", hex.into()),
-                ],
+                &[("position", position.into()), ("value", hex.into())],
             )
         });
         index += 1;
@@ -552,7 +537,22 @@ pub fn detect_checksum(
         .take(MAX_SAMPLES)
         .cloned()
         .collect();
+    let columns = analyse_columns(&samples);
+    detect_checksum_with_columns(&samples, options, &columns)
+}
 
+/// [`detect_checksum`] for a caller that has already profiled the columns and
+/// already chosen its sample.
+///
+/// The identification pass upstream analyses the same columns to decide what is
+/// worth solving, so making it hand them over is one pass rather than two — and,
+/// more importantly, means the two halves cannot reach different verdicts about
+/// the same byte.
+pub fn detect_checksum_with_columns(
+    samples: &[Vec<u8>],
+    options: &ChecksumDetectionOptions,
+    columns: &[ColumnStats],
+) -> ChecksumDetectionResult {
     if samples.is_empty() {
         return ChecksumDetectionResult {
             candidates: Vec::new(),
@@ -564,9 +564,18 @@ pub fn detect_checksum(
 
     let min_length = samples.iter().map(|f| f.len()).min().unwrap_or(0);
     let max_length = samples.iter().map(|f| f.len()).max().unwrap_or(0);
-    // Profile at least as deep as the deepest position being swept.
-    let depth = -options.positions.iter().copied().min().unwrap_or(-1);
-    let tail_columns = analyse_tail_columns(&samples, depth);
+
+    // Columns are profiled to the whole payload, because the calculation ranges
+    // have to see a run of padding wherever it starts. What the *result* carries
+    // is the tail, which is what the field promises and what a reader wants: on
+    // an all-constant frame id, every column would otherwise be listed to say
+    // the frame does not change.
+    let depth = (-options.positions.iter().copied().min().unwrap_or(-1)).max(MIN_TAIL_DEPTH);
+    let tail_columns: Vec<ColumnStats> = columns
+        .iter()
+        .filter(|c| c.position >= -depth)
+        .cloned()
+        .collect();
 
     let mut notes = vec![ChecksumNote::new(
         "analysed",
@@ -578,8 +587,8 @@ pub fn detect_checksum(
     )];
     notes.extend(constant_padding_notes(&tail_columns));
 
-    let specs = build_checksum_specs(&samples, options, &tail_columns);
-    let results = sweep_specs(&samples, &specs);
+    let specs = build_checksum_specs(samples, options, columns);
+    let results = sweep_specs(samples, &specs);
 
     notes.push(ChecksumNote::new(
         "configurationsTested",
@@ -589,10 +598,13 @@ pub fn detect_checksum(
         ],
     ));
 
+    // Scoring gets every column, not the trimmed tail: the `constantExcluded`
+    // bonus looks up the column at a range's end, which sits deeper than the
+    // swept positions whenever padding was trimmed out of the range.
     let ctx = ScoringContext {
-        columns: &tail_columns,
+        columns,
         header_boundaries: &options.header_boundaries,
-        frames: &samples,
+        frames: samples,
     };
 
     let scored: Vec<ChecksumCandidate> = results
@@ -607,7 +619,7 @@ pub fn detect_checksum(
 
     // Non-empty samples always yield a -1 column, so there is always something to
     // say about the byte a checksum would most likely occupy.
-    if let (true, Some(last)) = (candidates.is_empty(), column_at(&tail_columns, -1)) {
+    if let (true, Some(last)) = (candidates.is_empty(), column_at(columns, -1)) {
         notes.push(explain_no_candidates(last, samples.len()));
     }
 
@@ -626,12 +638,6 @@ mod tests {
         many_real_frames, modbus_frames, real_serial_frames, real_serial_frames_with_acks,
     };
     use serde_json::json;
-
-    /// Default profiling depth, matching what `detect_checksum` uses for the
-    /// default positions.
-    fn tail_columns(frames: &[Vec<u8>]) -> Vec<ChecksumColumnStat> {
-        analyse_tail_columns(frames, MIN_TAIL_DEPTH)
-    }
 
     fn note_codes(notes: &[ChecksumNote]) -> Vec<&str> {
         notes.iter().map(|n| n.code.as_str()).collect()
@@ -658,7 +664,7 @@ mod tests {
         // The shortest frame on the link must not gate the search: a bare ACK
         // cannot hold a checksum, and the frames that can still deserve one.
         let frames = real_serial_frames_with_acks();
-        let specs = build_checksum_specs(&frames, &Default::default(), &tail_columns(&frames));
+        let specs = build_checksum_specs(&frames, &Default::default(), &analyse_columns(&frames));
         assert!(!specs.is_empty(), "the ACKs emptied the search space");
 
         let best = detect_checksum(&frames, &Default::default())
@@ -781,51 +787,13 @@ mod tests {
         assert!(result.best_candidate.is_none());
     }
 
-    #[test]
-    fn test_analyse_tail_columns_is_end_relative() {
-        let columns = tail_columns(&real_serial_frames());
-
-        let last = columns.iter().find(|c| c.position == -1).unwrap();
-        assert_eq!(last.distinct_values, 4);
-        assert_eq!(last.sample_count, 5);
-        assert_eq!(
-            columns
-                .iter()
-                .find(|c| c.position == -2)
-                .unwrap()
-                .constant_value,
-            Some(0x00)
-        );
-    }
-
-    #[test]
-    fn test_analyse_tail_columns_skips_frames_too_short() {
-        let columns = tail_columns(&[vec![1, 2, 3, 4], vec![9]]);
-        assert_eq!(
-            columns
-                .iter()
-                .find(|c| c.position == -1)
-                .unwrap()
-                .sample_count,
-            2
-        );
-        assert_eq!(
-            columns
-                .iter()
-                .find(|c| c.position == -4)
-                .unwrap()
-                .sample_count,
-            1
-        );
-    }
-
     // ---- Candidate space --------------------------------------------------
 
     #[test]
     fn test_build_specs_includes_the_configuration_the_old_sweep_could_not_express() {
         let frames = real_serial_frames();
         let options = ChecksumDetectionOptions::default();
-        let specs = build_checksum_specs(&frames, &options, &tail_columns(&frames));
+        let specs = build_checksum_specs(&frames, &options, &analyse_columns(&frames));
 
         assert!(specs.iter().any(|s| s.algorithm == ChecksumAlgorithm::Sum8
             && s.position == -1
@@ -837,7 +805,7 @@ mod tests {
     fn test_build_specs_tries_both_endiannesses_only_for_two_byte_algorithms() {
         let frames = real_serial_frames();
         let options = ChecksumDetectionOptions::default();
-        let specs = build_checksum_specs(&frames, &options, &tail_columns(&frames));
+        let specs = build_checksum_specs(&frames, &options, &analyse_columns(&frames));
 
         let crc16: BTreeSet<bool> = specs
             .iter()
@@ -861,7 +829,7 @@ mod tests {
             header_boundaries: vec![4],
             ..Default::default()
         };
-        let specs = build_checksum_specs(&frames, &options, &tail_columns(&frames));
+        let specs = build_checksum_specs(&frames, &options, &analyse_columns(&frames));
 
         assert!(specs.iter().any(|s| s.calc_start_byte == 4));
         // The real answer starts at byte 1, which is not a declared boundary —
@@ -876,7 +844,7 @@ mod tests {
             lengths: vec![1],
             ..Default::default()
         };
-        let specs = build_checksum_specs(&frames, &options, &tail_columns(&frames));
+        let specs = build_checksum_specs(&frames, &options, &analyse_columns(&frames));
 
         assert!(!specs.is_empty());
         assert!(specs.iter().all(|s| s.byte_length == 1));
@@ -886,7 +854,7 @@ mod tests {
     fn test_build_specs_stays_within_a_sane_search_size() {
         let frames = real_serial_frames();
         let options = ChecksumDetectionOptions::default();
-        let specs = build_checksum_specs(&frames, &options, &tail_columns(&frames));
+        let specs = build_checksum_specs(&frames, &options, &analyse_columns(&frames));
 
         assert!(specs.len() > 50, "{} specs", specs.len());
         assert!(specs.len() < 400, "{} specs", specs.len());
