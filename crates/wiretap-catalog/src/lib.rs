@@ -36,4 +36,4 @@ pub use model::{
     TunnelProtocol, ValidationError,
 };
 pub use parse::CatalogError;
-pub use tunnel::{Direction, ModbusTunnel, TunnelMessage};
+pub use tunnel::{CrcPolicy, Direction, ModbusTunnel, TunnelMessage};
