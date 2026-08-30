@@ -10,6 +10,8 @@
 //! - [`mirror`] — live `mirror_of` validation: does a mirrored frame still agree
 //!   with its source, over the bytes it inherited?
 //! - [`modbus`] — the Modbus register-poll/encode model and shorthands.
+//! - [`tunnel`] — stateful reassembly for frames carrying a tunnelled protocol
+//!   (a Modbus RTU stream chopped across consecutive CAN frames).
 //! - [`dbc`] — Vector DBC ↔ catalogue TOML import/export.
 //!
 //! The Modbus parser/decoder was originally extracted from the Home Assistant
@@ -24,12 +26,14 @@ pub mod mirror;
 pub mod modbus;
 pub mod model;
 pub mod parse;
+pub mod tunnel;
 pub mod validate;
 
 pub use mirror::{MirrorTracker, MirrorVerdict};
 pub use model::{
-    CanConfig, Catalog, ChecksumConfig, Confidence, Endianness, Frame, HeaderField, Meta,
-    ModbusConfig, Mux, MuxCase, Protocol, RegisterType, SerialConfig, Signal, SignalFormat,
-    ValidationError,
+    CanConfig, Catalog, ChecksumConfig, Confidence, Endianness, Frame, FrameTunnel, HeaderField,
+    Meta, ModbusConfig, Mux, MuxCase, Protocol, RegisterType, SerialConfig, Signal, SignalFormat,
+    TunnelProtocol, ValidationError,
 };
 pub use parse::CatalogError;
+pub use tunnel::{Direction, ModbusTunnel, TunnelMessage};

@@ -283,12 +283,7 @@ impl ModbusManifest {
         if self.meta.register_base != 1 {
             return frame.register_number;
         }
-        let prefix = match frame.register_type {
-            RegisterType::Coil => 1,
-            RegisterType::Discrete => 10001,
-            RegisterType::Input => 30001,
-            RegisterType::Holding => 40001,
-        };
+        let prefix = frame.register_type.base_one_prefix() as u16;
         frame.register_number.saturating_sub(prefix)
     }
 
@@ -631,7 +626,7 @@ pub struct DecodedSignal {
 
 /// Modbus registers → big-endian byte buffer (MSB first per register),
 /// the standard on-wire order. Matches WireTAP's `registers_to_bytes`.
-fn registers_to_bytes(regs: &[u16]) -> Vec<u8> {
+pub(crate) fn registers_to_bytes(regs: &[u16]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(regs.len() * 2);
     for &r in regs {
         bytes.push((r >> 8) as u8);

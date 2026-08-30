@@ -272,6 +272,20 @@ pub fn crc16_modbus_checksum(data: &[u8]) -> u16 {
     crc16_parameterised(data, 0x8005, 0xFFFF, 0x0000, true, true)
 }
 
+/// Whether a Modbus RTU message carries a valid trailing CRC.
+///
+/// The CRC is the last two bytes, little-endian, over everything before it —
+/// the check every RTU framer and reassembler needs, so it lives here rather
+/// than being re-derived at each call site. A message shorter than the minimum
+/// (address, function, CRC) is never valid.
+pub fn crc16_modbus_valid(message: &[u8]) -> bool {
+    if message.len() < 4 {
+        return false;
+    }
+    let (body, crc) = message.split_at(message.len() - 2);
+    crc16_modbus_checksum(body) == u16::from_le_bytes([crc[0], crc[1]])
+}
+
 /// CRC-16 CCITT polynomial (0x1021, non-reflected).
 /// Common in telecommunications and some industrial protocols.
 pub fn crc16_ccitt_checksum(data: &[u8]) -> u16 {

@@ -269,6 +269,31 @@ fn parse_delimiter(body: &Value) -> Option<Vec<u8>> {
     (!bytes.is_empty()).then_some(bytes)
 }
 
+/// An authored Modbus register number as its protocol (wire) address. Base 0
+/// passes through; base 1 strips the traditional type prefix. The unified-model
+/// counterpart of [`crate::modbus::ModbusManifest::protocol_address`].
+fn protocol_address(register_number: u32, register_type: RegisterType, base_one: bool) -> u32 {
+    if !base_one {
+        return register_number;
+    }
+    register_number.saturating_sub(register_type.base_one_prefix())
+}
+
+/// Parse a frame's `[…tunnel]` table. An unrecognised `protocol` yields `None`
+/// here; [`crate::validate`] reports it rather than the parser failing the file.
+fn parse_tunnel(body: &Value) -> Option<FrameTunnel> {
+    let t = get(body, "tunnel")?;
+    let protocol = match as_str(t, "protocol")? {
+        "modbus_rtu" => TunnelProtocol::ModbusRtu,
+        _ => return None,
+    };
+    Some(FrameTunnel {
+        protocol,
+        device_address: as_u32(t, "device_address").and_then(|v| u8::try_from(v).ok()),
+        notes: parse_notes(t),
+    })
+}
+
 /// Parse per-frame `[[…checksum]]` (array) or `[…checksum]` (single table).
 fn parse_frame_checksums(body: &Value) -> Vec<FrameChecksum> {
     let one_checksum = |c: &Value| -> Option<FrameChecksum> {
@@ -681,6 +706,7 @@ fn modbus_frames(text: &str) -> Vec<Frame> {
                     .map(|s| map_modbus_signal(s, f.register_number as u32, f.register_type))
                     .collect(),
                 mux: None,
+                tunnel: None,
                 mirror_of: None,
                 copy_from: None,
                 modbus_register_type: Some(f.register_type),
@@ -805,6 +831,7 @@ impl Catalog {
                     is_fd: Some(is_fd),
                     signals: resolved.signals,
                     mux: resolved.mux,
+                    tunnel: parse_tunnel(body),
                     mirror_of: resolved.mirror_of,
                     copy_from: resolved.copy_from,
                     modbus_register_type: None,
@@ -841,6 +868,9 @@ impl Catalog {
                     is_fd: None,
                     signals: normalise_signals(get(body, "signals")),
                     mux: parse_mux(get(body, "mux")),
+                    // Tunnels are CAN-only: a serial source is already a byte
+                    // stream, and `FramingEncoding::ModbusRtu` frames it there.
+                    tunnel: None,
                     mirror_of: None,
                     copy_from: None,
                     modbus_register_type: None,
@@ -938,6 +968,31 @@ impl Catalog {
     pub fn frame(&self, id: u32) -> Option<&Frame> {
         self.frames.iter().find(|f| f.frame_id == id)
     }
+
+    /// Find the Modbus register frame at protocol (wire) address `register`,
+    /// for `register_type` and (when the frame names one) `device_address`.
+    ///
+    /// Protocol-filtered on purpose: [`Self::frame`] matches on `frame_id`
+    /// alone, so in a catalogue holding both — a CAN tunnel and the registers
+    /// it carries — CAN id `0x1E0` and Modbus register 480 are the same lookup.
+    ///
+    /// `register` is always the address as it appeared on the wire; a catalogue
+    /// authored in the traditional 1-based `3xxxx`/`4xxxx` form is converted to
+    /// match, so callers never have to know which form was used.
+    pub fn modbus_register_frame(
+        &self,
+        register: u16,
+        register_type: RegisterType,
+        device_address: u8,
+    ) -> Option<&Frame> {
+        let base_one = self.modbus.as_ref().and_then(|m| m.register_base) == Some(1);
+        self.frames.iter().find(|f| {
+            f.protocol == Protocol::Modbus
+                && f.modbus_register_type == Some(register_type)
+                && protocol_address(f.frame_id, register_type, base_one) == register as u32
+                && f.modbus_device_address.is_none_or(|a| a == device_address)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1019,6 +1074,106 @@ node_address = 3
                 .device_address,
             Some(3)
         );
+    }
+
+    #[test]
+    fn parses_a_can_tunnel_declaration() {
+        let toml = r#"
+[meta]
+name = "x"
+[frame.can."0x1E0"]
+length = 8
+[frame.can."0x1E0".tunnel]
+protocol = "modbus_rtu"
+device_address = 1
+notes = "Inverter <-> BMS Modbus RTU"
+[frame.can."0x200"]
+length = 8
+"#;
+        let c = Catalog::parse(toml).unwrap();
+        let t = c.frame(0x1E0).unwrap().tunnel.as_ref().unwrap();
+        assert_eq!(t.protocol, TunnelProtocol::ModbusRtu);
+        assert_eq!(t.device_address, Some(1));
+        assert_eq!(t.notes, vec!["Inverter <-> BMS Modbus RTU".to_string()]);
+        // A frame without the table is untouched.
+        assert!(c.frame(0x200).unwrap().tunnel.is_none());
+    }
+
+    #[test]
+    fn an_unknown_tunnel_protocol_parses_as_no_tunnel() {
+        // validate() reports it; the parser must not fail the whole file.
+        let toml = r#"
+[meta]
+name = "x"
+[frame.can."0x1E0"]
+length = 8
+[frame.can."0x1E0".tunnel]
+protocol = "carrier_pigeon"
+"#;
+        let c = Catalog::parse(toml).unwrap();
+        assert!(c.frame(0x1E0).unwrap().tunnel.is_none());
+    }
+
+    #[test]
+    fn modbus_register_lookup_is_protocol_filtered() {
+        // CAN 0x1E0 is 480, and so is the Modbus register — `frame()` matches
+        // on the id alone, so only the filtered lookup tells them apart.
+        let toml = r#"
+[meta]
+name = "x"
+[frame.can."0x1E0"]
+length = 8
+[frame.modbus.limits]
+register_number = 480
+register_type = "input"
+length = 1
+[[frame.modbus.limits.signals]]
+name = "Limit"
+start_bit = 0
+bit_length = 16
+"#;
+        let c = Catalog::parse(toml).unwrap();
+        assert_eq!(c.frame(480).unwrap().protocol, Protocol::Can);
+
+        let m = c
+            .modbus_register_frame(480, RegisterType::Input, 1)
+            .unwrap();
+        assert_eq!(m.protocol, Protocol::Modbus);
+        assert_eq!(m.key, "limits");
+        // Wrong register class, and an unknown register, both miss.
+        assert!(c
+            .modbus_register_frame(480, RegisterType::Holding, 1)
+            .is_none());
+        assert!(c
+            .modbus_register_frame(481, RegisterType::Input, 1)
+            .is_none());
+    }
+
+    #[test]
+    fn modbus_register_lookup_resolves_a_one_based_catalogue() {
+        // Authored in the traditional 3xxxx form; the wire address is 480.
+        let toml = r#"
+[meta]
+name = "x"
+[meta.modbus]
+register_base = 1
+[frame.modbus.limits]
+register_number = 30481
+register_type = "input"
+length = 1
+[[frame.modbus.limits.signals]]
+name = "Limit"
+start_bit = 0
+bit_length = 16
+"#;
+        let c = Catalog::parse(toml).unwrap();
+        assert!(c
+            .modbus_register_frame(480, RegisterType::Input, 1)
+            .is_some());
+        // The authored number is not the wire address, so it must not match.
+        assert!(c
+            .modbus_register_frame(30481, RegisterType::Input, 1)
+            .is_none());
     }
 
     #[test]

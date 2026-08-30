@@ -53,6 +53,18 @@ impl RegisterType {
         matches!(self, RegisterType::Holding | RegisterType::Coil)
     }
 
+    /// The traditional 1-based address prefix for this bank (`register_base = 1`),
+    /// which a wire address is offset from. The only place these four numbers
+    /// should appear.
+    pub fn base_one_prefix(self) -> u32 {
+        match self {
+            RegisterType::Coil => 1,
+            RegisterType::Discrete => 10001,
+            RegisterType::Input => 30001,
+            RegisterType::Holding => 40001,
+        }
+    }
+
     /// Lowercase tag, matching the manifest spelling.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -180,6 +192,35 @@ pub struct Mux {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
     pub cases: BTreeMap<String, MuxCase>,
+}
+
+/// The protocol carried inside a tunnel frame's payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TunnelProtocol {
+    /// Modbus RTU — a byte stream chopped across consecutive frames, with
+    /// message boundaries recovered from the RTU length rules and CRC.
+    ModbusRtu,
+}
+
+/// A frame that carries a tunnelled protocol rather than a fixed bit layout
+/// (`[frame.can.<key>.tunnel]`).
+///
+/// The payloads of consecutive frames with this id concatenate into one byte
+/// stream — both directions land on the same id — so decoding needs state
+/// across frames, which [`crate::decode`] deliberately does not have. See
+/// [`crate::tunnel`] for the decoder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameTunnel {
+    pub protocol: TunnelProtocol,
+    /// The Modbus slave address to sync on. Absent means "any valid address"
+    /// (`1..=247`), which resyncs more slowly after a dropped frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_address: Option<u8>,
+    /// Free-text notes on the tunnel declaration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// A per-frame checksum definition (`[[frame.<proto>.<key>.checksum]]`).
@@ -383,6 +424,9 @@ pub struct Frame {
     pub signals: Vec<Signal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mux: Option<Mux>,
+    /// Set when the frame carries a tunnelled protocol instead of a bit layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<FrameTunnel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mirror_of: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

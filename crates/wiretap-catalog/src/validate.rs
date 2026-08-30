@@ -165,6 +165,42 @@ fn validate_can_frame(frame_id: &str, frame_def: &Value, errors: &mut Vec<Valida
     if let Some(mux) = frame.get("mux") {
         validate_mux_object(&prefix, mux, errors);
     }
+
+    if let Some(tunnel) = frame.get("tunnel") {
+        validate_tunnel(&prefix, tunnel, errors);
+    }
+}
+
+/// A `[frame.can.<id>.tunnel]` declaration. The parser drops a tunnel it can't
+/// understand rather than failing the file, so a typo would otherwise decode as
+/// silence — these are the findings that say why.
+fn validate_tunnel(prefix: &str, tunnel: &Value, errors: &mut Vec<ValidationError>) {
+    let prefix = format!("{prefix}.tunnel");
+    let Some(table) = tunnel.as_table() else {
+        errors.push(err(prefix, "Tunnel definition must be a table"));
+        return;
+    };
+
+    match table.get("protocol").and_then(Value::as_str) {
+        Some("modbus_rtu") => {}
+        Some(other) => errors.push(err(
+            format!("{prefix}.protocol"),
+            format!("Unknown tunnel protocol '{other}' (expected 'modbus_rtu')"),
+        )),
+        None => errors.push(err(
+            format!("{prefix}.protocol"),
+            "Tunnel requires a protocol (expected 'modbus_rtu')",
+        )),
+    }
+
+    if let Some(addr) = table.get("device_address").and_then(Value::as_integer) {
+        if !(1..=247).contains(&addr) {
+            errors.push(err(
+                format!("{prefix}.device_address"),
+                format!("Device address {addr} must be between 1 and 247"),
+            ));
+        }
+    }
 }
 
 fn validate_signal(
@@ -933,6 +969,38 @@ bit_length = 16
 "#;
         let errs = validate(toml);
         assert_eq!(fields(&errs), vec!["frame.modbus.not_a_register"]);
+    }
+
+    #[test]
+    fn tunnel_rules() {
+        let case = |body: &str| {
+            let toml = format!(
+                "[meta]\nname = \"x\"\n[frame.can.\"0x1E0\"]\nlength = 8\n[frame.can.\"0x1E0\".tunnel]\n{body}"
+            );
+            validate(&toml)
+                .into_iter()
+                .map(|e| e.field)
+                .collect::<Vec<_>>()
+        };
+
+        assert!(case("protocol = \"modbus_rtu\"\ndevice_address = 1\n").is_empty());
+        assert!(case("protocol = \"modbus_rtu\"\n").is_empty());
+        assert_eq!(
+            case("protocol = \"j1939_tp\"\n"),
+            vec!["frame.can.0x1E0.tunnel.protocol"]
+        );
+        assert_eq!(
+            case("device_address = 1\n"),
+            vec!["frame.can.0x1E0.tunnel.protocol"]
+        );
+        assert_eq!(
+            case("protocol = \"modbus_rtu\"\ndevice_address = 0\n"),
+            vec!["frame.can.0x1E0.tunnel.device_address"]
+        );
+        assert_eq!(
+            case("protocol = \"modbus_rtu\"\ndevice_address = 248\n"),
+            vec!["frame.can.0x1E0.tunnel.device_address"]
+        );
     }
 
     #[test]
