@@ -266,10 +266,45 @@ pub fn crc8_nissan_checksum(data: &[u8]) -> u8 {
     crc8_parameterised(data, 0x85, 0x00, 0x00, false)
 }
 
+/// The Modbus polynomial (0x8005) as the reflected algorithm uses it.
+const CRC16_MODBUS_POLY_REFLECTED: u16 = 0xA001;
+
+/// One byte's worth of polynomial division, precomputed for all 256 inputs.
+const fn crc16_modbus_table() -> [u16; 256] {
+    let mut table = [0u16; 256];
+    let mut byte = 0usize;
+    while byte < 256 {
+        let mut crc = byte as u16;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ CRC16_MODBUS_POLY_REFLECTED
+            } else {
+                crc >> 1
+            };
+            bit += 1;
+        }
+        table[byte] = crc;
+        byte += 1;
+    }
+    table
+}
+
+static CRC16_MODBUS_TABLE: [u16; 256] = crc16_modbus_table();
+
 /// CRC-16 Modbus polynomial (0x8005, reflected).
 /// Used by Modbus RTU protocol.
+///
+/// Table-driven rather than a call to [`crc16_parameterised`], which is the
+/// same computation eight branches at a time. This one runs on the streaming
+/// path: reassembling an RTU stream CRCs every candidate boundary, and a
+/// desynced stream does that once per byte it drops, over a buffer that can be
+/// hundreds of bytes long. The general form stays bitwise — the solver sweeps
+/// tens of thousands of polynomials through it, so there is no table to build.
 pub fn crc16_modbus_checksum(data: &[u8]) -> u16 {
-    crc16_parameterised(data, 0x8005, 0xFFFF, 0x0000, true, true)
+    data.iter().fold(0xFFFF, |crc, &byte| {
+        (crc >> 8) ^ CRC16_MODBUS_TABLE[usize::from((crc ^ byte as u16) as u8)]
+    })
 }
 
 /// Whether a Modbus RTU message carries a valid trailing CRC.
@@ -413,6 +448,55 @@ mod tests {
             crc16_modbus_checksum(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x0A]),
             0xCDC5
         );
+    }
+
+    #[test]
+    fn test_crc16_modbus_standard_check_vector() {
+        assert_eq!(crc16_modbus_checksum(b"123456789"), 0x4B37);
+    }
+
+    /// The table has to agree with the bitwise general form for every input, not
+    /// just the published vectors — it is the same algorithm, and the only
+    /// reason to keep both is speed.
+    #[test]
+    fn test_crc16_modbus_table_matches_the_parameterised_form() {
+        // A deterministic LCG, so a failure is reproducible.
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut data = Vec::with_capacity(300);
+        for _ in 0..300 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            data.push((seed >> 33) as u8);
+        }
+        for len in 0..=data.len() {
+            let slice = &data[..len];
+            assert_eq!(
+                crc16_modbus_checksum(slice),
+                crc16_parameterised(slice, 0x8005, 0xFFFF, 0x0000, true, true),
+                "length {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_crc16_modbus_valid_checks_the_trailing_crc() {
+        let body = [0x01u8, 0x03, 0x00, 0x00, 0x00, 0x0A];
+        let mut message = body.to_vec();
+        message.extend(crc16_modbus_checksum(&body).to_le_bytes());
+        assert!(crc16_modbus_valid(&message));
+
+        // One flipped bit anywhere fails it.
+        let mut corrupt = message.clone();
+        corrupt[0] ^= 0x01;
+        assert!(!crc16_modbus_valid(&corrupt));
+        let mut bad_crc = message.clone();
+        *bad_crc.last_mut().unwrap() ^= 0xFF;
+        assert!(!crc16_modbus_valid(&bad_crc));
+
+        // Shorter than address + function + CRC is never a message.
+        assert!(!crc16_modbus_valid(&[]));
+        assert!(!crc16_modbus_valid(&message[..3]));
     }
 
     #[test]

@@ -1,5 +1,5 @@
-//! Tunnelled-protocol decoding: recovering messages from a byte stream that
-//! was chopped across consecutive frames.
+//! Modbus RTU reassembly: recovering messages from a byte stream, whether it
+//! arrives on a serial port or chopped across consecutive frames.
 //!
 //! [`crate::decode`] is stateless — one frame's bytes in, that frame's signals
 //! out. A tunnel breaks that: a Sungrow SBR's CAN `0x1E0` carries a Modbus RTU
@@ -17,12 +17,15 @@
 //! buffer is provably longer than any candidate before dropping a byte.
 //!
 //! The same reassembler serves a real serial port, where the RTU stream is not
-//! tunnelled inside anything: [`ModbusTunnel::push`] counts frames,
-//! [`ModbusTunnel::push_bytes`] does not, and [`ModbusTunnel::interpret`] takes
-//! a boundary somebody else already found. [`CrcPolicy::Lenient`] relaxes the
-//! CRC gate for a line whose CRCs cannot be trusted; see its docs for the cost.
+//! tunnelled inside anything — which is why the type is named for the stream it
+//! recovers rather than for the CAN tunnel it was written for.
+//! [`ModbusRtuStream::push`] counts frames, [`ModbusRtuStream::push_bytes`] does
+//! not, and [`ModbusRtuStream::interpret`] takes a boundary somebody else
+//! already found. [`CrcPolicy::Lenient`] relaxes the CRC gate for a line whose
+//! CRCs cannot be trusted; see its docs for the cost.
 
-use crate::model::{FrameTunnel, TunnelProtocol};
+use crate::modbus::protocol::{MAX_DATA_BYTES, MAX_RTU_LEN};
+use crate::model::{FrameTunnel, RegisterType, TunnelProtocol};
 use wiretap_checksum::algorithms::crc16_modbus_valid;
 
 /// Which side of the exchange a message came from.
@@ -65,7 +68,7 @@ pub enum CrcPolicy {
 /// One complete Modbus RTU message recovered from the stream. CRC-validated
 /// unless [`CrcPolicy::Lenient`] is in force — check `crc_valid`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct TunnelMessage {
+pub struct ModbusRtuMessage {
     pub direction: Direction,
     pub device_address: u8,
     pub function: u8,
@@ -90,31 +93,17 @@ pub struct TunnelMessage {
     pub frame_count: u32,
 }
 
-impl TunnelMessage {
+impl ModbusRtuMessage {
     /// The register block as big-endian bytes, for [`crate::decode`].
     pub fn register_bytes(&self) -> Vec<u8> {
         crate::modbus::manifest::registers_to_bytes(&self.registers)
     }
 }
 
-/// Longest Modbus RTU message: address + function + byte count + 252 data + CRC.
-const MAX_RTU_LEN: usize = 256;
-
 /// Buffer ceiling. Two full messages of slack is enough to hold a
 /// request/response pair mid-reassembly; past that the stream is desynced and
 /// holding more bytes only delays recovery.
 const MAX_BUFFER: usize = MAX_RTU_LEN * 2;
-
-/// Largest data block any read or write carries: 125 registers, or 2000 coils
-/// packed eight to a byte.
-const MAX_DATA_BYTES: usize = 250;
-
-/// What one Modbus request may read or write, per the spec. A message claiming
-/// more than this contradicts itself, whatever its CRC says.
-const MAX_REGISTERS_PER_READ: usize = 125;
-const MAX_COILS_PER_READ: usize = 2000;
-const MAX_REGISTERS_PER_WRITE: usize = 123;
-const MAX_COILS_PER_WRITE: usize = 1968;
 
 /// A candidate message layout at the head of the buffer.
 #[derive(Debug, Clone, Copy)]
@@ -125,7 +114,7 @@ struct Candidate {
 
 /// What one pass over the head of the buffer achieved.
 enum Step {
-    Message(TunnelMessage),
+    Message(ModbusRtuMessage),
     /// No message starts here. The caller decides what that means: mid-stream a
     /// byte is junk and gets dropped, at end of stream it is the head of the
     /// residue and gets kept.
@@ -139,7 +128,7 @@ enum Step {
 /// One instance per (session, frame id) — the buffer is the tunnel's serial
 /// line, and interleaving two tunnels into it would corrupt both.
 #[derive(Debug)]
-pub struct ModbusTunnel {
+pub struct ModbusRtuStream {
     buf: Vec<u8>,
     device_address: Option<u8>,
     policy: CrcPolicy,
@@ -152,7 +141,7 @@ pub struct ModbusTunnel {
     last_request: Option<(u8, u16, u16)>,
 }
 
-impl ModbusTunnel {
+impl ModbusRtuStream {
     /// A tunnel the catalogue declared.
     pub fn new(tunnel: &FrameTunnel) -> Self {
         debug_assert!(matches!(tunnel.protocol, TunnelProtocol::ModbusRtu));
@@ -176,7 +165,7 @@ impl ModbusTunnel {
     }
 
     /// Feed one frame's payload; return every message it completed.
-    pub fn push(&mut self, bytes: &[u8]) -> Vec<TunnelMessage> {
+    pub fn push(&mut self, bytes: &[u8]) -> Vec<ModbusRtuMessage> {
         if bytes.is_empty() {
             return Vec::new();
         }
@@ -187,7 +176,7 @@ impl ModbusTunnel {
     /// Feed raw bytes from a serial line. Same reassembly as [`Self::push`],
     /// without the frame accounting — there are no frames to count, so every
     /// message reports `frame_count: 1`.
-    pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<TunnelMessage> {
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<ModbusRtuMessage> {
         if bytes.is_empty() {
             return Vec::new();
         }
@@ -212,7 +201,7 @@ impl ModbusTunnel {
     /// one recovered from a byte stream are labelled identically. The reassembly
     /// buffer is never touched, so the two can share an instance — which they
     /// must, because the outstanding-request state lives here.
-    pub fn interpret(&mut self, raw: &[u8]) -> Option<TunnelMessage> {
+    pub fn interpret(&mut self, raw: &[u8]) -> Option<ModbusRtuMessage> {
         if raw.len() < 4 || !self.address_matches(raw[0]) {
             return None;
         }
@@ -220,7 +209,18 @@ impl ModbusTunnel {
             .into_iter()
             .flatten()
             .find(|c| c.len == raw.len())?;
-        Some(self.build(raw.to_vec(), chosen.direction, crc16_modbus_valid(raw)))
+        let crc_valid = crc16_modbus_valid(raw);
+        // A CRC that agrees vouches for the message outright, implausible header
+        // or not — the length table does not model every function code, and the
+        // checksum is far stronger evidence than the table is. Without one, the
+        // header has to be self-consistent, which is the same bar
+        // [`CrcPolicy::Lenient`] sets for a boundary it guessed. Otherwise any
+        // five bytes that open like an address and a function code would be
+        // reported as a response carrying no registers.
+        if !crc_valid && !is_plausible(raw, &chosen) {
+            return None;
+        }
+        Some(self.build(raw.to_vec(), chosen.direction, crc_valid))
     }
 
     /// End of stream: no more bytes are coming.
@@ -231,7 +231,7 @@ impl ModbusTunnel {
     /// yield is yielded. Returns the messages recovered and the bytes left over,
     /// which are by construction not a message — a truncated message is reported
     /// whole rather than resynced away a byte at a time.
-    pub fn finish(&mut self) -> (Vec<TunnelMessage>, Vec<u8>) {
+    pub fn finish(&mut self) -> (Vec<ModbusRtuMessage>, Vec<u8>) {
         let out = self.drain_messages(true);
         self.pending_frames = 0;
         (out, std::mem::take(&mut self.buf))
@@ -240,7 +240,7 @@ impl ModbusTunnel {
     /// Drain every message the buffer can yield. `at_end` also drops the
     /// wait-for-a-longer-candidate rule: mid-stream a byte that starts nothing
     /// is junk to be dropped, at end of stream it is the head of the residue.
-    fn drain_messages(&mut self, at_end: bool) -> Vec<TunnelMessage> {
+    fn drain_messages(&mut self, at_end: bool) -> Vec<ModbusRtuMessage> {
         let mut out = Vec::new();
         loop {
             self.skip_to_address();
@@ -340,13 +340,13 @@ impl ModbusTunnel {
     }
 
     /// Turn validated bytes into a message, resolving what the wire leaves out.
-    fn build(&mut self, raw: Vec<u8>, direction: Direction, crc_valid: bool) -> TunnelMessage {
+    fn build(&mut self, raw: Vec<u8>, direction: Direction, crc_valid: bool) -> ModbusRtuMessage {
         let device_address = raw[0];
         let function = raw[1];
         // 0 on the byte-stream and pre-framed paths, which count no frames.
         let frame_count = self.pending_frames.max(1);
 
-        let mut msg = TunnelMessage {
+        let mut msg = ModbusRtuMessage {
             direction,
             device_address,
             function,
@@ -482,31 +482,29 @@ fn is_plausible(buf: &[u8], candidate: &Candidate) -> bool {
         (f, _) if f & 0x80 != 0 => buf.get(2).is_none_or(|&code| (0x01..=0x0B).contains(&code)),
         // Read request: a quantity the bank can actually serve.
         (0x01..=0x04, Direction::Request) => {
-            let max = if matches!(func, 0x03 | 0x04) {
-                MAX_REGISTERS_PER_READ
-            } else {
-                MAX_COILS_PER_READ
-            };
-            be_at(buf, 4).is_none_or(|quantity| (1..=max).contains(&(quantity as usize)))
+            RegisterType::from_function_code(func).is_some_and(|bank| {
+                be_at(buf, 4).is_none_or(|quantity| (1..=bank.max_per_read()).contains(&quantity))
+            })
         }
         // Read response: a data block, two bytes per register for the register
         // banks. Coil banks pack eight to a byte, so any count is possible.
-        (0x01..=0x04, Direction::Response) => buf.get(2).is_none_or(|&n| {
-            let n = n as usize;
-            (1..=MAX_DATA_BYTES).contains(&n)
-                && (!matches!(func, 0x03 | 0x04) || n.is_multiple_of(2))
-        }),
+        (0x01..=0x04, Direction::Response) => {
+            let register_bank =
+                RegisterType::from_function_code(func).is_some_and(RegisterType::is_register_bank);
+            buf.get(2).is_none_or(|&n| {
+                let n = n as usize;
+                (1..=MAX_DATA_BYTES).contains(&n) && (!register_bank || n.is_multiple_of(2))
+            })
+        }
         // Write-multiple request: the byte count has to match the quantity it
-        // claims to be writing.
+        // claims to be writing. Both codes address a writable bank, so the cap
+        // and the packing rule come from the bank rather than the code.
         (0x0F | 0x10, Direction::Request) => {
-            be_at(buf, 4).zip(buf.get(6)).is_none_or(|(quantity, &n)| {
-                let quantity = quantity as usize;
-                let (expected, max) = if func == 0x10 {
-                    (quantity * 2, MAX_REGISTERS_PER_WRITE)
-                } else {
-                    (quantity.div_ceil(8), MAX_COILS_PER_WRITE)
-                };
-                (1..=max).contains(&quantity) && n as usize == expected
+            RegisterType::from_function_code(func).is_some_and(|bank| {
+                let max = bank.max_per_write().unwrap_or(0);
+                be_at(buf, 4).zip(buf.get(6)).is_none_or(|(quantity, &n)| {
+                    (1..=max).contains(&quantity) && n as usize == bank.data_bytes(quantity)
+                })
             })
         }
         _ => true,
@@ -540,16 +538,16 @@ mod tests {
     use super::*;
     use wiretap_checksum::algorithms::crc16_modbus_checksum;
 
-    fn tunnel(device_address: Option<u8>) -> ModbusTunnel {
-        ModbusTunnel::new(&FrameTunnel {
+    fn strict(device_address: Option<u8>) -> ModbusRtuStream {
+        ModbusRtuStream::new(&FrameTunnel {
             protocol: TunnelProtocol::ModbusRtu,
             device_address,
             notes: Vec::new(),
         })
     }
 
-    fn lenient(device_address: Option<u8>) -> ModbusTunnel {
-        ModbusTunnel::with_crc_policy(device_address, CrcPolicy::Lenient)
+    fn lenient(device_address: Option<u8>) -> ModbusRtuStream {
+        ModbusRtuStream::with_crc_policy(device_address, CrcPolicy::Lenient)
     }
 
     fn hex(s: &str) -> Vec<u8> {
@@ -574,7 +572,7 @@ mod tests {
     }
 
     /// Feed a message the way CAN carries it: split at 8-byte boundaries.
-    fn push_chunked(t: &mut ModbusTunnel, msg: &[u8]) -> Vec<TunnelMessage> {
+    fn push_chunked(t: &mut ModbusRtuStream, msg: &[u8]) -> Vec<ModbusRtuMessage> {
         msg.chunks(8).flat_map(|c| t.push(c)).collect()
     }
 
@@ -582,7 +580,7 @@ mod tests {
 
     #[test]
     fn decodes_read_input_request() {
-        let mut t = tunnel(Some(1));
+        let mut t = strict(Some(1));
         let msgs = push_chunked(&mut t, &hex("01044DE20002C691"));
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].direction, Direction::Request);
@@ -595,7 +593,7 @@ mod tests {
 
     #[test]
     fn decodes_read_input_response_split_8_plus_1() {
-        let mut t = tunnel(Some(1));
+        let mut t = strict(Some(1));
         push_chunked(&mut t, &hex("01044DE20002C691"));
         let msgs = push_chunked(&mut t, &hex("01040401F40000BB8A"));
         assert_eq!(msgs.len(), 1);
@@ -609,7 +607,7 @@ mod tests {
 
     #[test]
     fn decodes_read_holding_response_split_8_plus_8_plus_1() {
-        let mut t = tunnel(Some(1));
+        let mut t = strict(Some(1));
         let req = push_chunked(&mut t, &hex("01034DE200067292"));
         assert_eq!(req[0].quantity, Some(6));
 
@@ -624,7 +622,7 @@ mod tests {
 
     #[test]
     fn register_bytes_are_big_endian() {
-        let mut t = tunnel(Some(1));
+        let mut t = strict(Some(1));
         push_chunked(&mut t, &hex("01044DE20002C691"));
         let msgs = push_chunked(&mut t, &hex("01040401F40000BB8A"));
         assert_eq!(msgs[0].register_bytes(), hex("01F40000"));
@@ -632,7 +630,7 @@ mod tests {
 
     #[test]
     fn a_partial_message_yields_nothing_until_complete() {
-        let mut t = tunnel(Some(1));
+        let mut t = strict(Some(1));
         assert!(t.push(&hex("01030C01F40000012C")).is_empty());
         assert!(t.push(&hex("000000C80000")).is_empty());
         assert_eq!(t.push(&hex("D570")).len(), 1);
@@ -640,7 +638,7 @@ mod tests {
 
     #[test]
     fn resyncs_past_leading_junk() {
-        let mut t = tunnel(Some(1));
+        let mut t = strict(Some(1));
         // A stray byte that is not the device address is skipped outright.
         let msgs = t.push(&hex("FF01044DE20002C691"));
         assert_eq!(msgs.len(), 1);
@@ -649,7 +647,7 @@ mod tests {
 
     #[test]
     fn resyncs_past_a_false_address_byte() {
-        let mut t = tunnel(Some(1));
+        let mut t = strict(Some(1));
         // A leading 0x01 that starts nothing valid must be dropped, not left to
         // block the real message behind it.
         let msgs = t.push(&hex("0101044DE20002C691"));
@@ -659,7 +657,7 @@ mod tests {
 
     #[test]
     fn back_to_back_messages_in_one_push() {
-        let mut t = tunnel(Some(1));
+        let mut t = strict(Some(1));
         let msgs = t.push(&hex("01044DE20002C69101040401F40000BB8A"));
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].direction, Direction::Request);
@@ -669,7 +667,7 @@ mod tests {
 
     #[test]
     fn decodes_exception_response() {
-        let mut t = tunnel(Some(1));
+        let mut t = strict(Some(1));
         push_chunked(&mut t, &hex("01044DE20002C691"));
         // Illegal data address.
         let msgs = t.push(&with_crc("018402"));
@@ -682,7 +680,7 @@ mod tests {
 
     #[test]
     fn write_single_pairs_request_then_response() {
-        let mut t = tunnel(Some(1));
+        let mut t = strict(Some(1));
         let raw = with_crc("0106138800C8");
         let first = t.push(&raw);
         assert_eq!(first[0].direction, Direction::Request);
@@ -695,7 +693,7 @@ mod tests {
 
     #[test]
     fn decodes_write_multiple_request_and_response() {
-        let mut t = tunnel(Some(1));
+        let mut t = strict(Some(1));
         let msgs = push_chunked(&mut t, &with_crc("0110138800020400C801F4"));
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].direction, Direction::Request);
@@ -708,7 +706,7 @@ mod tests {
 
     #[test]
     fn unconstrained_address_accepts_any_slave() {
-        let mut t = tunnel(None);
+        let mut t = strict(None);
         let msgs = t.push(&with_crc("2A044DE20002"));
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].device_address, 42);
@@ -716,7 +714,7 @@ mod tests {
 
     #[test]
     fn a_desynced_stream_does_not_grow_without_bound() {
-        let mut t = tunnel(Some(1));
+        let mut t = strict(Some(1));
         // 0x01 0x07 is a valid address but an unhandled function, so nothing
         // ever completes.
         for _ in 0..500 {
@@ -728,8 +726,8 @@ mod tests {
     #[test]
     fn for_address_matches_the_catalogue_constructor() {
         let stream = with_crc("01044DE20002");
-        let declared = tunnel(Some(1)).push_bytes(&stream);
-        let bare = ModbusTunnel::for_address(Some(1)).push_bytes(&stream);
+        let declared = strict(Some(1)).push_bytes(&stream);
+        let bare = ModbusRtuStream::for_address(Some(1)).push_bytes(&stream);
         assert_eq!(declared, bare);
         assert_eq!(declared.len(), 1);
     }
@@ -739,7 +737,7 @@ mod tests {
     #[test]
     fn lenient_emits_the_bad_crc_message_strict_discards() {
         let bytes = with_bad_crc("01040401F40000");
-        assert!(tunnel(Some(1)).push_bytes(&bytes).is_empty());
+        assert!(strict(Some(1)).push_bytes(&bytes).is_empty());
 
         let msgs = lenient(Some(1)).push_bytes(&bytes);
         assert_eq!(msgs.len(), 1);
@@ -820,9 +818,27 @@ mod tests {
 
     // ---- interpret: one already-framed message ----
 
+    /// Without a CRC to vouch for it, a candidate whose own header contradicts
+    /// itself is not a message. Five bytes opening like an address and a read
+    /// function code match the `5 + byte_count` response layout with a byte
+    /// count of zero — which no device sends.
+    #[test]
+    fn interpret_rejects_an_implausible_message_with_a_bad_crc() {
+        let mut t = ModbusRtuStream::for_address(Some(1));
+        assert!(t.interpret(&hex("0103006B00")).is_none());
+    }
+
+    /// A CRC that agrees still wins, whatever the length table makes of it.
+    #[test]
+    fn interpret_trusts_a_valid_crc_over_the_length_table() {
+        let mut t = ModbusRtuStream::for_address(Some(1));
+        let framed = with_crc("010300");
+        assert!(t.interpret(&framed).is_some());
+    }
+
     #[test]
     fn interpret_reads_one_framed_request() {
-        let mut t = ModbusTunnel::for_address(Some(1));
+        let mut t = ModbusRtuStream::for_address(Some(1));
         let msg = t.interpret(&hex("01044DE20002C691")).unwrap();
         assert_eq!(msg.direction, Direction::Request);
         assert_eq!(msg.start_register, Some(0x4DE2));
@@ -833,7 +849,7 @@ mod tests {
 
     #[test]
     fn interpret_pairs_a_response_with_the_preceding_request() {
-        let mut t = ModbusTunnel::for_address(Some(1));
+        let mut t = ModbusRtuStream::for_address(Some(1));
         t.interpret(&hex("01044DE20002C691")).unwrap();
         let msg = t.interpret(&hex("01040401F40000BB8A")).unwrap();
         assert_eq!(msg.direction, Direction::Response);
@@ -843,7 +859,7 @@ mod tests {
 
     #[test]
     fn interpret_resolves_write_single_direction_from_the_outstanding_request() {
-        let mut t = ModbusTunnel::for_address(Some(1));
+        let mut t = ModbusRtuStream::for_address(Some(1));
         let raw = with_crc("0106138800C8");
         assert_eq!(t.interpret(&raw).unwrap().direction, Direction::Request);
         assert_eq!(t.interpret(&raw).unwrap().direction, Direction::Response);
@@ -851,7 +867,7 @@ mod tests {
 
     #[test]
     fn interpret_rejects_a_length_no_candidate_explains() {
-        let mut t = ModbusTunnel::for_address(Some(1));
+        let mut t = ModbusRtuStream::for_address(Some(1));
         assert!(t.interpret(&hex("01044DE2000200")).is_none());
         assert!(t.interpret(&hex("0104")).is_none());
         // Wrong slave.
@@ -862,7 +878,7 @@ mod tests {
     fn interpret_flags_a_bad_crc_rather_than_rejecting_it() {
         // The caller supplied the boundary, so the CRC is a verdict, not a gate
         // — in either policy.
-        for mut t in [ModbusTunnel::for_address(Some(1)), lenient(Some(1))] {
+        for mut t in [ModbusRtuStream::for_address(Some(1)), lenient(Some(1))] {
             let msg = t.interpret(&with_bad_crc("01044DE20002")).unwrap();
             assert!(!msg.crc_valid);
             assert_eq!(msg.start_register, Some(0x4DE2));
@@ -874,18 +890,18 @@ mod tests {
         // An FC01 response for 17..=24 coils packs into 3 bytes, making it 8
         // bytes long — exactly a request. Both paths must read it the same way.
         let raw = with_crc("010103010203");
-        let framed = ModbusTunnel::for_address(Some(1))
+        let framed = ModbusRtuStream::for_address(Some(1))
             .interpret(&raw)
             .unwrap()
             .direction;
-        let streamed = ModbusTunnel::for_address(Some(1)).push_bytes(&raw)[0].direction;
+        let streamed = ModbusRtuStream::for_address(Some(1)).push_bytes(&raw)[0].direction;
         assert_eq!(framed, streamed);
         assert_eq!(framed, Direction::Request);
     }
 
     #[test]
     fn interpret_leaves_the_buffer_untouched() {
-        let mut t = ModbusTunnel::for_address(Some(1));
+        let mut t = ModbusRtuStream::for_address(Some(1));
         // Half a message in the reassembly buffer.
         t.push_bytes(&hex("01030C01F40000012C"));
         let buffered = t.buf.clone();
@@ -897,7 +913,7 @@ mod tests {
 
     #[test]
     fn push_bytes_reassembles_a_message_fed_one_byte_at_a_time() {
-        let mut t = ModbusTunnel::for_address(Some(1));
+        let mut t = ModbusRtuStream::for_address(Some(1));
         let raw = hex("01030C01F40000012C000000C80000D570");
         let msgs: Vec<_> = raw.iter().flat_map(|b| t.push_bytes(&[*b])).collect();
         assert_eq!(msgs.len(), 1);
@@ -908,7 +924,7 @@ mod tests {
 
     #[test]
     fn back_to_back_messages_fed_one_byte_at_a_time() {
-        let mut t = ModbusTunnel::for_address(Some(1));
+        let mut t = ModbusRtuStream::for_address(Some(1));
         let mut stream = with_crc("01044DE20002");
         stream.extend(with_crc("01040401F40000"));
         let msgs: Vec<_> = stream.iter().flat_map(|b| t.push_bytes(&[*b])).collect();
@@ -936,7 +952,7 @@ mod tests {
 
     #[test]
     fn finish_reports_a_truncated_message_whole() {
-        let mut t = ModbusTunnel::for_address(Some(1));
+        let mut t = ModbusRtuStream::for_address(Some(1));
         // Nine bytes of a 17-byte response: not a message, and not noise either.
         let partial = hex("01030C01F40000012C00");
         t.push_bytes(&partial);
@@ -949,7 +965,7 @@ mod tests {
 
     #[test]
     fn finish_recovers_a_message_then_reports_the_residue() {
-        let mut t = ModbusTunnel::for_address(Some(1));
+        let mut t = ModbusRtuStream::for_address(Some(1));
         let mut stream = with_crc("01044DE20002");
         stream.extend(hex("010401"));
         let streamed = t.push_bytes(&stream);
@@ -964,7 +980,7 @@ mod tests {
 
     #[test]
     fn finish_is_idempotent() {
-        let mut t = ModbusTunnel::for_address(Some(1));
+        let mut t = ModbusRtuStream::for_address(Some(1));
         t.push_bytes(&hex("01030C01F4"));
         let first = t.finish();
         assert!(!first.1.is_empty());

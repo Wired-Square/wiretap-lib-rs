@@ -209,7 +209,7 @@ pub enum TunnelProtocol {
 /// The payloads of consecutive frames with this id concatenate into one byte
 /// stream — both directions land on the same id — so decoding needs state
 /// across frames, which [`crate::decode`] deliberately does not have. See
-/// [`crate::tunnel`] for the decoder.
+/// [`crate::modbus_rtu_stream`] for the decoder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameTunnel {

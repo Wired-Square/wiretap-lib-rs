@@ -44,13 +44,14 @@ stringified for display or an entity state.
   "CDAB"), `enum`/`hex`/`ascii`/`utf8`/`unix_time` formats, and mux selection
   (single / range `0-3` / list `1,2,5` / nested). One implementation — the
   Modbus register decoder shares the same bit-extraction core.
-- **Tunnel** — `tunnel::ModbusTunnel` reassembles a protocol carried *inside* a
-  frame id. A `[frame.can.<id>.tunnel]` declaration marks the id as a Modbus RTU
-  byte stream: consecutive payloads concatenate, message boundaries come from the
-  RTU length rules, and CRC-16/Modbus gates every message. Both directions share
-  the id, so a read response inherits its register address from the request it
-  answers. Unlike the rest of decode this is stateful and order-dependent — feed
-  every frame, in order, one tunnel per stream.
+- **Modbus RTU stream** — `modbus_rtu_stream::ModbusRtuStream` reassembles an RTU
+  byte stream: message boundaries come from the RTU length rules, and
+  CRC-16/Modbus gates every message. It serves a plain serial port, and a
+  protocol carried *inside* a frame id — a `[frame.can.<id>.tunnel]` declaration
+  marks that id as one such stream, whose consecutive payloads concatenate. Both
+  directions share the id, so a read response inherits its register address from
+  the request it answers. Unlike the rest of decode this is stateful and
+  order-dependent — feed every frame, in order, one stream per source.
 - **Encode** (Modbus) — values → register writes (inverse of decode): masked
   bit-fields, register-contiguous batching, `register_type` writability check.
 - **DBC** — import a Vector `.dbc` to catalogue TOML and export back
