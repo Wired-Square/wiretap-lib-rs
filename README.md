@@ -60,24 +60,18 @@ wiretap-protocol = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git",
 rewrites the pin in each *crate's* README, but the workspace root is not a
 package, so a real version here would go stale on the next release.)
 
-**Both URL forms work and the choice is the consumer's, not the crate's.** This
-repository is public, so `https` needs no key; `ssh` needs one and is only
-convenient where a developer already has it. Pick by what has to build the
-consumer, not by habit — WireTAP-Server pins `wiretap-protocol` over `https`
-because a stock CI runner, a container image build and a musl cross-build all
-have to resolve it and none of them has a key.
+Both URL forms work; the choice belongs to the consumer. This repository is
+public, so `https` needs no key — WireTAP-Server pins over `https` because a
+stock CI runner, a container build and a musl cross-build all have to resolve it
+and none of them has a key.
 
-### Two things a consumer is relying on
+Two things consumers rely on that are not visible from their side: a tag names a
+tree whose tests passed, and a crate README's pin names a tag that exists.
+`scripts/check-release-contract.sh` holds `release.toml` to both and runs first
+in the pre-release hook. And **a tag is immutable once pinned** — moving one
+changes what a consumer builds with no lockfile change to show for it. Cut a new
+patch instead.
 
-Worth knowing before changing `release.toml`, because neither is visible from
-the consumer's side:
+## Licence
 
-- **The pre-release hook is the consumer's test gate.** It runs the full
-  fmt/clippy/test gate *before* the version is committed and tagged, so a tag
-  cannot name a tree whose tests failed. WireTAP-Server does not run
-  `wiretap-protocol`'s GVRET golden-byte tests in its own CI and does not need
-  to, because of this. It holds only for tags cut by `cargo release`; a
-  hand-cut tag has nothing behind it.
-- **A tag is immutable once pinned.** Moving one silently changes what a
-  consumer builds, with no lockfile change to show for it. Cut a new patch
-  instead.
+MIT © Wired Square.

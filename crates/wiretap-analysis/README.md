@@ -1,66 +1,40 @@
 # wiretap-analysis
 
-Payload analysis for WireTAP frames: the identification pass that says which
-bytes are worth solving as a checksum, the geometries to solve them over, and
-the scan that drives the whole thing across a capture.
+Payload analysis for WireTAP frames in the [`wiretap-lib`](../../) workspace:
+which bytes are worth solving as a checksum at all, the geometries to solve them
+over, and the scan that drives both across a capture.
 
-- **identification** — `checksum_evidence`, the per-column verdict
-- **geometry** — `solve_targets`, what to hand
-  [`wiretap-checksum`](../wiretap-checksum)'s solvers
-- **scan** — `scan_frames` / `scan_groups`: group by frame id, sample, identify,
-  sweep, solve, rank. It lives here rather than in an application because all of
-  it is a pure function of payloads, and because the other consumers — a headless
-  agent tool, a catalogue validator — cannot reach into an app binary.
+Where [`wiretap-checksum`](../wiretap-checksum) answers *what algorithm is this
+byte*, this crate answers the prior and cheaper question — *is this byte a
+checksum* — which usually decides the answer, because most links carry no
+checksum on most frame ids.
 
-Per-byte-column statistics live in
-[`wiretap-checksum`](../wiretap-checksum), beside the end-relative addressing
-they are indexed by, and are re-exported here. They used to exist twice, once on
-each side of this boundary, and the two copies had already drifted into
-disagreeing about when a column counts as padding.
+## What's here
 
-The split from [`wiretap-checksum`](../wiretap-checksum) is a real seam. That
-crate answers *what algorithm is this byte*. This one answers the prior and
-cheaper question — *is this byte a checksum at all* — which on a real bus is
-usually the one that decides the answer, because most links carry no checksum on
-most frame ids.
+- **`checksum_evidence`** — the per-column verdict. A checksum is a function of
+  the other bytes, so two payloads differing only in this column rule it out
+  outright; what survives is separated on responsiveness and near-injectivity
+- **`solve_targets`** — each surviving column crossed with every calculation
+  range `wiretap-checksum::calc_ranges` offers, so a checksum that skips a
+  leading type byte reaches the solver and not only the sweep
+- **`scan_frames` / `scan_groups`** — group by frame id, sample, identify,
+  sweep, solve, rank. It lives here rather than in an application because it is
+  a pure function of payloads, and the other consumers cannot reach into an app
+  binary
 
-## The decisive test is a rejection, not a score
-
-A checksum is a **function of the other bytes**. So if two payloads agree on
-every byte except this column and this column differs, no function can produce
-both. That is arithmetic, not a heuristic, and it needs no threshold — it
-removes counters, sequence numbers and free-running timers outright.
-
-What survives is separated by two further facts:
-
-- **responsiveness** — a checksum changes almost every time the payload does,
-  colliding about one time in `2^bits`; a sensor byte sits still while other
-  bytes move, because it measures one quantity and they measure others;
-- **near-injectivity** — `n` distinct payloads should produce close to
-  `256(1 - e^(-n/256))` distinct checksum bytes. A byte oscillating over four
-  values while a hundred different payloads go past is measuring something else.
-
-Entropy alone cannot make the first distinction, which is the trap worth naming:
-cell-voltage frames jitter constantly, reach near-maximum entropy, and contain
-no checksum.
-
-## What it is not
-
-Identification **narrows** the search; it does not decide the answer. Where every
-field moves on every frame, a data byte is as responsive as a checksum and both
-survive. The property that matters is the other direction — the real checksum
-must never be filtered out — and that is what the tests pin.
-
-`solve_targets` follows the same rule about ranges. Each surviving column is
-crossed with every calculation range `wiretap-checksum::calc_ranges` offers,
-rather than assuming the calculation starts at byte 0 — so a checksum that skips
-a leading type byte reaches the solver instead of only the sweep. Several of
-those ranges will often solve the same frame, and folding them back into one
-answer is the caller's job; see that crate's README for why.
+Per-byte-column statistics live in [`wiretap-checksum`](../wiretap-checksum),
+beside the addressing they are indexed by, and are re-exported here.
 
 Measured on a 62-id Sungrow BMS capture: 496 byte columns reduce to 27
-candidates across 5 frame ids in 650µs, and solving all of those exhaustively
-for custom CRC polynomials takes a further 800µs.
+candidates across 5 frame ids in 650 µs, and solving all of them exhaustively
+for custom CRC polynomials takes a further 800 µs.
 
-This crate is consumed by path within the workspace and is released as part of
-the workspace `vX.Y.Z` tag — it is not pinned directly.
+## Using it
+
+Consumed by path within the workspace; released as part of the workspace
+`vX.Y.Z` tag, not pinned directly.
+
+Identification **narrows** the search and does not decide it: where every field
+moves on every frame, a data byte is as responsive as a checksum and both
+survive. The property that matters is the other direction — a real checksum must
+never be filtered out — and that is what the tests pin.

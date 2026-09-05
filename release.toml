@@ -18,11 +18,14 @@ allow-branch = ["main"]
 tag-name = "v{{version}}"
 pre-release-commit-message = "Release v{{version}}"
 
-# CI parity, run before the version is committed/tagged.
+# The consumer contract guard, then CI parity — run before the version is
+# committed and tagged, so a tag is never cut from a red tree or with a pin that
+# will quietly go stale. See scripts/check-release-contract.sh for what a
+# consumer is relying on and why this file has to keep backing it.
 pre-release-hook = [
     "bash",
     "-c",
-    "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --all",
+    "\"$WORKSPACE_ROOT\"/scripts/check-release-contract.sh && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --all",
 ]
 
 # Keep each crate README's pin example pointing at the version being released.
