@@ -18,7 +18,7 @@ for byte. It depends on nothing at all: no serde, no async runtime, no driver.
 ## Using it
 
 ```toml
-wiretap-protocol = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.15.0" }
+wiretap-protocol = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.15.1" }
 ```
 
 `https`, not the `ssh` form the workspace README shows: this repository is
