@@ -8,8 +8,7 @@
 #   cargo release minor -x               # 0.7.0 -> 0.8.0
 #
 # Distributed by git tag — consumers pin `tag = "vX.Y.Z"` and build from source
-# — so we never publish to crates.io. The pre-release hook runs the exact CI
-# gate (fmt · clippy · test), so a tag is never cut from a red tree.
+# — so we never publish to crates.io.
 
 publish = false
 push = true

@@ -30,7 +30,9 @@ Encoders take a caller's buffer and scalars —
 `encode_frame_into(out, ts_us, arb_id, extended, bus, data, is_fd)` — because
 each consumer's frame type is its own and they are not reconcilable: the capture
 server's is CAN-only and stores no length code, the desktop's is multi-protocol
-and is a serde contract with its frontend.
+and is a serde contract with its frontend. It follows that the crate depends on
+nothing: a client speaking one of these protocols should not have to take a
+capture stack to do it.
 
 **Before changing `gvret`:** the trailing byte after a frame's payload is a
 checksum every participant guesses differently, and the dialect they all

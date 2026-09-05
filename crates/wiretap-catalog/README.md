@@ -17,7 +17,8 @@ decoding happens once in Rust rather than per consumer.
 - **`validate::validate`** — `{ field, message }` findings: signal and mux
   rules, DBC-name compatibility, Modbus register resolution
 - **`decode::decode_frame` / `decode_by_id`** — bytes to signal values.
-  16/64-bit signed and unsigned, `factor`/`offset`, byte and word order
+  1–64 bit signed and unsigned (to 2048 for string formats),
+  `factor`/`offset`, byte and word order
   (Sungrow "CDAB"), `enum`/`hex`/`ascii`/`utf8`/`unix_time`, and mux selection
   (single, range `0-3`, list `1,2,5`, nested)
 - **`modbus`** — the register poll/encode workflow, sharing the same
@@ -33,6 +34,8 @@ decoding happens once in Rust rather than per consumer.
   `toml_edit`; only the targeted entry changes
 - **`migrate::migrate`** — upgrade a catalogue's *text* to the current schema,
   comment-preserving and idempotent
+- **`mirror`** — `MirrorTracker` / `MirrorVerdict`, live validation that a
+  mirrored frame still matches the frame it copies
 
 ## Using it
 

@@ -11,6 +11,10 @@
 //!   grouped sweep that measures many specs against many frames.
 //! - [`detect`] — the engine: build the candidate space from column priors,
 //!   sweep it, score and rank what survives, and explain the verdict.
+//! - [`solve`] — computing the answer instead of enumerating candidates:
+//!   additive residues, and a CRC search with `init`/`xorOut` collapsed out.
+//! - [`sampling`] — picking payloads worth solving over, because a periodic
+//!   link hands you a hundred copies of one frame.
 //! - [`notes`] — the translatable note type every explanation crosses as, and
 //!   [`ALL_NOTES`], the manifest a consumer pins its locale file against.
 //!

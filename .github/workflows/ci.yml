@@ -27,3 +27,9 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --all
+
+      # The release config's promises to consumers, checked on every push and
+      # PR rather than only at release time. The pre-release hook runs this too,
+      # but a hook cannot notice its own deletion — this step can.
+      - name: Release contract
+        run: scripts/check-release-contract.sh

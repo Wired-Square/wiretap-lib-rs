@@ -6,8 +6,8 @@
 //!   sample, identify, sweep, solve, rank.
 //!
 //! Per-byte-column statistics live in [`wiretap_checksum::columns`], beside the
-//! end-relative addressing they are indexed by, and are re-exported here for
-//! callers that only speak to this crate.
+//! end-relative addressing they are indexed by. A caller that needs them
+//! depends on that crate directly, as this one does; they are not re-exported.
 //!
 //! `wiretap-checksum` answers *what algorithm is this byte*; this crate answers
 //! the prior question — *is this byte a checksum at all* — and drives the scan

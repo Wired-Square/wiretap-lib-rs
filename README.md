@@ -18,8 +18,8 @@ A Cargo workspace of related **WireTAP** Rust libraries. Each crate lives under
 `wiretap-checksum` are primitives with no dependency on the catalogue model, and
 `wiretap-analysis` sits on top of `wiretap-checksum`. `wiretap-protocol` stands
 apart from all of them: it is what two repositories have to agree on byte for
-byte, and it depends on nothing. Read a crate's own README for what it does and
-why it does it that way.
+byte, and it depends on nothing. Read a crate's own README for what it is and how
+to use it; the reasoning lives in the module docs of the code it describes.
 
 ## Develop
 
@@ -27,10 +27,13 @@ why it does it that way.
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --all
+scripts/check-release-contract.sh
 ```
 
-These three are the CI gate (`.github/workflows/ci.yml`, on `main` + PRs) — run
-them locally before pushing.
+These four are the CI gate (`.github/workflows/ci.yml`, on `main` + PRs) — run
+them locally before pushing. The first three also run in the pre-release hook;
+the fourth checks that they still do, and is the one to run after editing
+`release.toml` or a README pin.
 
 ## Release
 
@@ -44,21 +47,16 @@ cargo release minor -x     # --execute: bump every crate, commit, tag, push
 
 The whole workspace is versioned and released **as one unit** — `shared-version
 = true`, so every crate carries the same number and one `vX.Y.Z` tag covers them
-all. There is no per-crate release. Releases run from `main` only, and the
-pre-release hook runs the CI gate, so a tag is never cut from a red tree.
+all. There is no per-crate release. Releases run from `main` only.
 
 Crates depend on each other by path, so a tag's tree already contains every
 crate's matching source. A consumer pins whichever crate it needs at that tag
 and the path dependencies resolve inside the checkout:
 
 ```toml
-wiretap-catalog  = { git = "ssh://git@github.com/Wired-Square/wiretap-lib-rs.git", tag = "vX.Y.Z" }
+wiretap-catalog  = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "vX.Y.Z" }
 wiretap-protocol = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "vX.Y.Z" }
 ```
-
-(Versions left as placeholders deliberately — `pre-release-replacements`
-rewrites the pin in each *crate's* README, but the workspace root is not a
-package, so a real version here would go stale on the next release.)
 
 Both URL forms work; the choice belongs to the consumer. This repository is
 public, so `https` needs no key — WireTAP-Server pins over `https` because a

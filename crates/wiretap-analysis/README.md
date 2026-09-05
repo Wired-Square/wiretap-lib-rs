@@ -11,30 +11,25 @@ checksum on most frame ids.
 
 ## What's here
 
-- **`checksum_evidence`** — the per-column verdict. A checksum is a function of
-  the other bytes, so two payloads differing only in this column rule it out
-  outright; what survives is separated on responsiveness and near-injectivity
+- **`checksum_evidence`** — the per-column verdict: which bytes could be a
+  checksum at all
 - **`solve_targets`** — each surviving column crossed with every calculation
   range `wiretap-checksum::calc_ranges` offers, so a checksum that skips a
   leading type byte reaches the solver and not only the sweep
 - **`scan_frames` / `scan_groups`** — group by frame id, sample, identify,
-  sweep, solve, rank. It lives here rather than in an application because it is
-  a pure function of payloads, and the other consumers cannot reach into an app
-  binary
+  sweep, solve, rank
 
 Per-byte-column statistics live in [`wiretap-checksum`](../wiretap-checksum),
-beside the addressing they are indexed by, and are re-exported here.
-
-Measured on a 62-id Sungrow BMS capture: 496 byte columns reduce to 27
-candidates across 5 frame ids in 650 µs, and solving all of them exhaustively
-for custom CRC polynomials takes a further 800 µs.
+beside the addressing they are indexed by; reach for them there directly.
 
 ## Using it
 
-Consumed by path within the workspace; released as part of the workspace
-`vX.Y.Z` tag, not pinned directly.
+```toml
+wiretap-analysis = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.15.0" }
+```
 
-Identification **narrows** the search and does not decide it: where every field
-moves on every frame, a data byte is as responsive as a checksum and both
-survive. The property that matters is the other direction — a real checksum must
-never be filtered out — and that is what the tests pin.
+Nothing in this workspace depends on it; the WireTAP desktop is its consumer.
+
+Identification **narrows** the search rather than deciding it, and the property
+the tests pin is the one that matters — a real checksum must never be filtered
+out. That argument is in `src/checksum.rs`, beside the test that holds it.

@@ -6,8 +6,10 @@ checksum configuration explains these bytes* — and says why when nothing does.
 
 ## What's here
 
-- **algorithms** — XOR, Sum8, seven CRC-8 variants, CRC-16 Modbus and CCITT,
-  all through `crc8_parameterised` / `crc16_parameterised`
+- **algorithms** — eleven named ones: XOR, Sum8, seven CRC-8 variants, CRC-16
+  Modbus and CCITT. The CRC-8s and CCITT run through `crc8_parameterised` /
+  `crc16_parameterised`; Modbus is table-driven for the streaming path, and
+  XOR and Sum8 are plain folds
 - **frame addressing** — `resolve_byte_index`, `extract_checksum`,
   `validate_checksum`; offsets are end-relative, so mixed frame lengths on one
   link line up
@@ -30,8 +32,12 @@ the caller translates.
 
 ## Using it
 
-Consumed by path within the workspace; released as part of the workspace
-`vX.Y.Z` tag, not pinned directly.
+```toml
+wiretap-checksum = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.15.0" }
+```
+
+Also used by path within the workspace, by
+[`wiretap-analysis`](../wiretap-analysis).
 
 Two caveats a caller must not get wrong are documented where they are
 implemented rather than here: `init` and `xorOut` are not separately
