@@ -12,11 +12,14 @@ A Cargo workspace of related **WireTAP** Rust libraries. Each crate lives under
 | [`wiretap-decode`](crates/wiretap-decode) | Protocol-agnostic decode core — bit extraction, 16-bit word-swap, exact `Decimal` scaling, and value formatting. `wiretap-catalog` builds on it; it has no dependency on the catalogue model. |
 | [`wiretap-checksum`](crates/wiretap-checksum) | Checksum algorithms (XOR, Sum8, CRC-8/16) and the engine that works out which one a link is using — a scored sweep of the named algorithms, plus solvers that recover an arbitrary CRC polynomial or an offset sum outright. |
 | [`wiretap-analysis`](crates/wiretap-analysis) | Payload analysis: per-byte-column statistics, and the identification pass that decides which bytes are worth solving as a checksum at all. Builds on `wiretap-checksum`. |
+| [`wiretap-protocol`](crates/wiretap-protocol) | The wire protocols WireTAP speaks, as scalars: the CAN data length code table, the GVRET serial protocol, and the ingest id-flag layout. No dependencies at all — not even serde. |
 
 `wiretap-catalog` is the top of the stack; `wiretap-decode` and
 `wiretap-checksum` are primitives with no dependency on the catalogue model, and
-`wiretap-analysis` sits on top of `wiretap-checksum`. Read a crate's own README
-for what it does and why it does it that way.
+`wiretap-analysis` sits on top of `wiretap-checksum`. `wiretap-protocol` stands
+apart from all of them: it is what two repositories have to agree on byte for
+byte, and it depends on nothing. Read a crate's own README for what it does and
+why it does it that way.
 
 ## Develop
 
@@ -49,9 +52,32 @@ crate's matching source. A consumer pins whichever crate it needs at that tag
 and the path dependencies resolve inside the checkout:
 
 ```toml
-wiretap-catalog = { git = "ssh://git@github.com/Wired-Square/wiretap-lib-rs.git", tag = "vX.Y.Z" }
+wiretap-catalog  = { git = "ssh://git@github.com/Wired-Square/wiretap-lib-rs.git", tag = "vX.Y.Z" }
+wiretap-protocol = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "vX.Y.Z" }
 ```
 
-(Left as a placeholder deliberately — `pre-release-replacements` rewrites the
-pin in each *crate's* README, but the workspace root is not a package, so a real
-version here would go stale on the next release.)
+(Versions left as placeholders deliberately — `pre-release-replacements`
+rewrites the pin in each *crate's* README, but the workspace root is not a
+package, so a real version here would go stale on the next release.)
+
+**Both URL forms work and the choice is the consumer's, not the crate's.** This
+repository is public, so `https` needs no key; `ssh` needs one and is only
+convenient where a developer already has it. Pick by what has to build the
+consumer, not by habit — WireTAP-Server pins `wiretap-protocol` over `https`
+because a stock CI runner, a container image build and a musl cross-build all
+have to resolve it and none of them has a key.
+
+### Two things a consumer is relying on
+
+Worth knowing before changing `release.toml`, because neither is visible from
+the consumer's side:
+
+- **The pre-release hook is the consumer's test gate.** It runs the full
+  fmt/clippy/test gate *before* the version is committed and tagged, so a tag
+  cannot name a tree whose tests failed. WireTAP-Server does not run
+  `wiretap-protocol`'s GVRET golden-byte tests in its own CI and does not need
+  to, because of this. It holds only for tags cut by `cargo release`; a
+  hand-cut tag has nothing behind it.
+- **A tag is immutable once pinned.** Moving one silently changes what a
+  consumer builds, with no lockfile change to show for it. Cut a new patch
+  instead.
