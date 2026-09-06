@@ -28,7 +28,7 @@ beside the addressing they are indexed by; reach for them there directly.
 wiretap-analysis = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.15.1" }
 ```
 
-Nothing in this workspace depends on it; the WireTAP desktop is its consumer.
+Nothing in this workspace depends on it; its consumers are outside.
 
 Identification **narrows** the search rather than deciding it, and the property
 the tests pin is the one that matters — a real checksum must never be filtered

@@ -3,9 +3,8 @@
 //! The wire carries a *code*; a database column stores a *length*; above 8
 //! bytes on CAN FD the two differ. That is the trap this module exists to hold
 //! in one place. The sixteen-entry table is otherwise easy to write out by
-//! hand, and is: five times over in the WireTAP desktop's Rust, again in its
-//! Python tools, and once in the capture server. Every copy has to agree, and
-//! nothing makes them.
+//! hand, and had been, nine times over across the consumers of this crate.
+//! Every copy has to agree, and nothing makes them.
 
 /// CAN FD data length code → byte count. Below 9 the code *is* the length.
 pub const FD_DLC_LEN: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64];

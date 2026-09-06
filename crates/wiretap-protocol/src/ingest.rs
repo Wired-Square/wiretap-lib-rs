@@ -1,11 +1,10 @@
 //! The id-flag layout of the WireTAP binary ingest protocol.
 //!
-//! Only the layout. The framing, the CRC and the message types stay in
-//! WireTAP-Server's `wiretap-ingest-proto`, where both ends of that wire
-//! already are — this is here because a *third* encoder packs an arbitration id
-//! and these flags the same way: the WireTAP desktop's HTTP import record,
-//! which shares the bit assignment and nothing else at all. That record's own
-//! layout is not shared, and is not this crate's business.
+//! Only the layout. The framing, the CRC and the message types stay where both
+//! ends of that wire already are, together; this is here because a *third*
+//! encoder packs an arbitration id and these flags the same way and shares
+//! nothing else at all with either of them. That encoder's own record layout is
+//! not shared, and is not this crate's business.
 //!
 //! The flag positions differ from GVRET's, which marks an extended id with the
 //! top bit rather than bit 29. Only the id width is common, and it comes from

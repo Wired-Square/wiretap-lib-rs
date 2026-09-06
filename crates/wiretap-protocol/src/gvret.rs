@@ -1,19 +1,31 @@
-//! GVRET wire codec: bytes in, commands out; frames in, bytes out.
+//! GVRET wire codec, both ends of it.
 //!
-//! Pure and synchronous, so the bytes a client sees can be asserted without
+//! Pure and synchronous, so the bytes either end sees can be asserted without
 //! opening a socket. The golden byte strings in the tests below were captured
 //! from the Python implementation this replaced.
 //!
-//! Protocol reference: <https://github.com/collin80/M2RET/blob/master/CommProtocol.txt>
+//! Protocol reference: <https://github.com/collin80/M2RET/blob/master/CommProtocol.txt>,
+//! and `docs/gvret.md` for the full opcode surface including the parts nothing
+//! here speaks.
 //!
-//! | Opcode  | Direction | Meaning            |
-//! |---------|-----------|--------------------|
-//! | `F1 00` | both      | CAN frame (TX in, RX out) |
-//! | `F1 01` | out       | timebase           |
-//! | `F1 06` | out       | CAN bus parameters |
-//! | `F1 07` | out       | device info        |
-//! | `F1 09` | out       | keepalive          |
-//! | `F1 0C` | out       | bus count          |
+//! | Opcode  | host → device        | device → host        |
+//! |---------|----------------------|----------------------|
+//! | `E7 E7` | enter binary mode    | —                    |
+//! | `F1 00` | transmit this frame  | a frame off the bus  |
+//! | `F1 01` | ask                  | timebase             |
+//! | `F1 06` | ask                  | CAN bus parameters   |
+//! | `F1 07` | ask                  | device info          |
+//! | `F1 09` | —                    | keepalive            |
+//! | `F1 0C` | ask                  | bus count            |
+//!
+//! # Two ends, one module
+//!
+//! [`Decoder`] and the `encode_*` reply functions are the **device** end: what a
+//! capture server needs to look like a GVRET adapter. [`DeviceDecoder`] and
+//! [`encode_transmit`] are the **host** end: what a client needs to talk to one.
+//! They are here together so the id packing, the opcode numbers and the data
+//! length code table cannot drift apart between the two — which they did, until
+//! this module existed.
 //!
 //! # The trailing checksum byte
 //!
@@ -25,14 +37,20 @@
 //! only dispatches once it arrives — while its XOR comparison is commented out;
 //! SavvyCAN sends a hardcoded `0`, not an XOR.
 //!
-//! This encoder writes `0x00`, which is what the spec says and what the
-//! firmware emits. [`Decoder`] does not consume the byte on a transmit, which
-//! is safe rather than correct: no sender in the field puts `0xF1` there —
-//! SavvyCAN hardcodes `0x00`, and the WireTAP desktop appends nothing at all —
-//! so the resync scan discards it either way, and there is nothing to discard
-//! when it is absent. Both are stated here rather than fixed, because every end
-//! of this protocol is a live participant and changing the dialect is a
-//! protocol change, not a refactor.
+//! All four positions this module takes are the ones already in the field, and
+//! none of them is the spec:
+//!
+//! - [`encode_frame_into`] writes `0x00`, which is what the spec says and what
+//!   the firmware emits.
+//! - [`encode_transmit_into`] appends **nothing**. Real adapters accept that,
+//!   and it is what the clients in the field send.
+//! - [`Decoder`] does not consume the byte on a transmit, and
+//!   [`DeviceDecoder`] does not consume it on a frame. Both are safe rather
+//!   than correct: no sender in the field puts `0xF1` there, so the resync scan
+//!   discards it, and there is nothing to discard when it is absent.
+//!
+//! Stated here rather than fixed, because every end of this protocol is a live
+//! participant and changing the dialect is a protocol change, not a refactor.
 
 use crate::dlc::{dlc_to_len, payload_dlc};
 /// GVRET masks the same CAN id widths every protocol here does; only the flag
@@ -50,9 +68,28 @@ const GVRET_EFF_BIT: u32 = 0x8000_0000;
 pub const SYNC: [u8; 2] = [0xE7, 0xE7];
 const CMD: u8 = 0xF1;
 
+const OP_FRAME: u8 = 0x00;
+const OP_TIMEBASE: u8 = 0x01;
+const OP_CANBUS_PARAMS: u8 = 0x06;
+const OP_DEV_INFO: u8 = 0x07;
+const OP_KEEPALIVE: u8 = 0x09;
+const OP_NUM_BUSES: u8 = 0x0C;
+
+/// The bare two-byte requests a host sends. Spelled from the same opcodes the
+/// device end decodes, so a request and the arm that answers it cannot drift.
+pub const REQ_TIMEBASE: [u8; 2] = [CMD, OP_TIMEBASE];
+pub const REQ_CANBUS_PARAMS: [u8; 2] = [CMD, OP_CANBUS_PARAMS];
+pub const REQ_DEV_INFO: [u8; 2] = [CMD, OP_DEV_INFO];
+pub const REQ_NUM_BUSES: [u8; 2] = [CMD, OP_NUM_BUSES];
+
 /// Longest frame this encoder emits: 2 opcode + 4 ts + 4 id + 1 bus/dlc +
 /// 64 payload + 1 terminator.
 pub const MAX_FRAME_BYTES: usize = 76;
+
+/// Longest transmit this encoder emits: 2 opcode + 4 id + 1 bus + 1 len +
+/// 64 payload. One byte shorter than a captured frame despite carrying the same
+/// payload — it has no timestamp, and no trailing checksum.
+pub const MAX_TRANSMIT_BYTES: usize = 72;
 
 /// Something the client asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,7 +114,7 @@ pub enum ClientCommand {
 }
 
 /// Split a GVRET id word into its arbitration id and extended flag.
-fn split_gvret_id(raw: u32) -> (u32, bool) {
+pub fn split_gvret_id(raw: u32) -> (u32, bool) {
     let extended = raw & GVRET_EFF_BIT != 0;
     (
         raw & if extended { ARB_MASK_EXT } else { ARB_MASK_STD },
@@ -86,7 +123,7 @@ fn split_gvret_id(raw: u32) -> (u32, bool) {
 }
 
 /// The inverse of [`split_gvret_id`].
-fn make_gvret_id(arb_id: u32, extended: bool) -> u32 {
+pub fn make_gvret_id(arb_id: u32, extended: bool) -> u32 {
     if extended {
         (arb_id & ARB_MASK_EXT) | GVRET_EFF_BIT
     } else {
@@ -138,7 +175,7 @@ impl Decoder {
             }
             let cmd = self.buf[1];
 
-            if cmd == 0x00 {
+            if cmd == OP_FRAME {
                 match self.take_transmit() {
                     Some(c) => out.push(c),
                     // Incomplete: leave it buffered for the next read.
@@ -149,11 +186,11 @@ impl Decoder {
 
             self.buf.drain(..2);
             match cmd {
-                0x01 => out.push(ClientCommand::Timebase),
-                0x06 => out.push(ClientCommand::CanbusParams),
-                0x07 => out.push(ClientCommand::DevInfo),
-                0x09 => out.push(ClientCommand::Keepalive),
-                0x0C => out.push(ClientCommand::NumBuses),
+                OP_TIMEBASE => out.push(ClientCommand::Timebase),
+                OP_CANBUS_PARAMS => out.push(ClientCommand::CanbusParams),
+                OP_DEV_INFO => out.push(ClientCommand::DevInfo),
+                OP_KEEPALIVE => out.push(ClientCommand::Keepalive),
+                OP_NUM_BUSES => out.push(ClientCommand::NumBuses),
                 // Unknown opcode: header consumed, request ignored.
                 _ => {}
             }
@@ -196,7 +233,7 @@ impl Decoder {
     /// the field.
     fn take_transmit(&mut self) -> Option<ClientCommand> {
         // The caller has already established the two header bytes.
-        debug_assert!(self.buf.len() >= 2 && self.buf[0] == CMD && self.buf[1] == 0x00);
+        debug_assert!(self.buf.len() >= 2 && self.buf[0] == CMD && self.buf[1] == OP_FRAME);
         if self.buf.len() < 8 {
             return None;
         }
@@ -229,7 +266,7 @@ impl Decoder {
 /// what clients have been parsing; they are not derived from anything.
 pub fn encode_dev_info() -> Vec<u8> {
     let build: u16 = 400;
-    let mut v = vec![CMD, 0x07];
+    let mut v = vec![CMD, OP_DEV_INFO];
     v.extend_from_slice(&build.to_le_bytes());
     v.extend_from_slice(&[1, 0, 0, 0]); // eeprom version, file type, auto start, single wire
     v
@@ -239,7 +276,7 @@ pub fn encode_dev_info() -> Vec<u8> {
 /// buses; further buses are only visible through `F1 0C`.
 pub fn encode_canbus_params(bus_count: u8, speeds: &[u32]) -> Vec<u8> {
     let mut v = Vec::with_capacity(12);
-    v.extend_from_slice(&[CMD, 0x06]);
+    v.extend_from_slice(&[CMD, OP_CANBUS_PARAMS]);
     for i in 0..2 {
         let enabled = bus_count as usize > i;
         let speed = if enabled {
@@ -255,19 +292,19 @@ pub fn encode_canbus_params(bus_count: u8, speeds: &[u32]) -> Vec<u8> {
 
 /// `F1 0C` — number of buses.
 pub fn encode_num_buses(n: u8) -> Vec<u8> {
-    vec![CMD, 0x0C, n]
+    vec![CMD, OP_NUM_BUSES, n]
 }
 
 /// `F1 01` — microseconds since the connection opened.
 pub fn encode_timebase(us: u32) -> Vec<u8> {
-    let mut v = vec![CMD, 0x01];
+    let mut v = vec![CMD, OP_TIMEBASE];
     v.extend_from_slice(&us.to_le_bytes());
     v
 }
 
 /// `F1 09` — keepalive, with its fixed `DE AD` body.
 pub fn encode_keepalive() -> Vec<u8> {
-    vec![CMD, 0x09, 0xDE, 0xAD]
+    vec![CMD, OP_KEEPALIVE, 0xDE, 0xAD]
 }
 
 /// Append `F1 00` — a captured frame — to `out`.
@@ -282,6 +319,15 @@ pub fn encode_keepalive() -> Vec<u8> {
 /// The byte packing `bus` and `dlc` carries the **data length code** in its
 /// low nibble, not the byte count. Above 8 bytes on CAN FD those differ, and a
 /// client's parser depends on getting the code.
+///
+/// A payload whose length has no exact code is **zero-padded up to the one it
+/// gets**, because this protocol has no other framing: a reader takes exactly
+/// as many bytes as the code names, so a frame that claimed twelve and wrote
+/// nine would swallow the head of the next one and there is nothing to
+/// resynchronise on until the next byte that happens to be `0xF1`. CAN FD has
+/// no 9, 10 or 11 byte length, so a real bus cannot produce one — but an ingest
+/// client can send one, and a stream that cannot be parsed is worse than three
+/// bytes that were not on the wire.
 ///
 /// `ts_us` is microseconds since the client's connection opened, and it is a
 /// `u32`: the timebase **wraps every 71m34s**, which is the protocol's rule and
@@ -299,15 +345,17 @@ pub fn encode_frame_into(
     is_fd: bool,
 ) {
     let dlc = payload_dlc(data.len(), is_fd);
+    let len = dlc_to_len(dlc, is_fd);
     // The code may round up past what the caller supplied; never read beyond it.
-    let take = dlc_to_len(dlc, is_fd).min(data.len());
+    let take = len.min(data.len());
 
-    out.reserve(12 + take);
-    out.extend_from_slice(&[CMD, 0x00]);
+    out.reserve(12 + len);
+    out.extend_from_slice(&[CMD, OP_FRAME]);
     out.extend_from_slice(&ts_us.to_le_bytes());
     out.extend_from_slice(&make_gvret_id(arb_id, extended).to_le_bytes());
     out.push(((bus & 0x0F) << 4) | (dlc & 0x0F));
     out.extend_from_slice(&data[..take]);
+    out.resize(out.len() + (len - take), 0);
     // The trailing checksum byte; see this module's header.
     out.push(0x00);
 }
@@ -324,6 +372,214 @@ pub fn encode_frame(
 ) -> Vec<u8> {
     let mut v = Vec::with_capacity(MAX_FRAME_BYTES);
     encode_frame_into(&mut v, ts_us, arb_id, extended, bus, data, is_fd);
+    v
+}
+
+// ---------------------------------------------------------------------------
+// The host end: what a client speaks to a device.
+// ---------------------------------------------------------------------------
+
+/// How much unsynchronised rubbish a device stream may accumulate before the
+/// decoder stops hoping and drops it.
+///
+/// Only reached when a read contains no `0xF1` at all — a partial frame that
+/// *starts* with one is kept however long the stream stalls, because it is a
+/// message in progress rather than noise.
+pub const MAX_RESYNC_BYTES: usize = 1024;
+
+/// Something a device said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceMessage {
+    /// `F1 00` — a frame off the bus.
+    ///
+    /// `dlc` is the **data length code**, not `data.len()`: above 8 bytes on
+    /// CAN FD the two differ, and only the code was on the wire. GVRET carries
+    /// no FD flag of its own, so a caller that needs one infers it from the
+    /// payload length, which is what every client already does.
+    ///
+    /// `ts_us` is the device's own microsecond counter, which wraps every
+    /// 71m34s and is unrelated to any host clock. A client that wants wall time
+    /// substitutes its own; it is returned rather than dropped because dropping
+    /// it here would put it out of every caller's reach.
+    Frame {
+        ts_us: u32,
+        bus: u8,
+        arb_id: u32,
+        extended: bool,
+        dlc: u8,
+        data: Vec<u8>,
+    },
+    /// `F1 01` — microseconds since the connection opened.
+    Timebase(u32),
+    /// `F1 06` — the legacy two-bus view. Further buses are only visible
+    /// through [`DeviceMessage::NumBuses`].
+    CanbusParams {
+        enabled: [bool; 2],
+        speeds: [u32; 2],
+    },
+    /// `F1 07`
+    DevInfo {
+        build: u16,
+        eeprom_version: u8,
+        file_type: u8,
+        auto_start: u8,
+        single_wire: u8,
+    },
+    /// `F1 09`. The fixed `DE AD` body is consumed but not checked — a device
+    /// that sends something else is still sending a keepalive.
+    Keepalive,
+    /// `F1 0C` — how many buses the device has. Not range-checked here; what
+    /// counts as a plausible answer is the client's policy.
+    NumBuses(u8),
+}
+
+/// Incremental decoder for the stream one device is sending.
+///
+/// The mirror of [`Decoder`], and the same shape: feed it whatever a read
+/// returned, take whatever that completed, leave the rest buffered.
+#[derive(Debug, Default)]
+pub struct DeviceDecoder {
+    buf: Vec<u8>,
+}
+
+impl DeviceDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed received bytes, returning every complete message they produced.
+    ///
+    /// A byte that cannot start a message is skipped rather than stalling the
+    /// connection, which is also what discards a frame's trailing checksum
+    /// byte — see this module's header for why that is left alone.
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<DeviceMessage> {
+        self.buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+
+        loop {
+            match self.buf.iter().position(|&b| b == CMD) {
+                Some(at) => self.buf.drain(..at),
+                None => {
+                    // Nothing here can begin a message. Holding it costs memory
+                    // for no possible gain, so past a bound it is dropped.
+                    if self.buf.len() > MAX_RESYNC_BYTES {
+                        self.buf.clear();
+                    }
+                    return out;
+                }
+            };
+
+            if self.buf.len() < 2 {
+                return out;
+            }
+
+            if self.buf[1] == OP_FRAME {
+                match self.take_frame() {
+                    Some(m) => out.push(m),
+                    // Incomplete: leave it buffered for the next read.
+                    None => return out,
+                }
+                continue;
+            }
+
+            // Every reply below is fixed-length, so the whole of it has to be
+            // here before any of it is consumed.
+            let (len, decode): (usize, fn(&[u8]) -> DeviceMessage) = match self.buf[1] {
+                OP_TIMEBASE => (6, |b| DeviceMessage::Timebase(le_u32(&b[2..6]))),
+                OP_CANBUS_PARAMS => (12, |b| DeviceMessage::CanbusParams {
+                    enabled: [b[2] & 1 != 0, b[7] & 1 != 0],
+                    speeds: [le_u32(&b[3..7]), le_u32(&b[8..12])],
+                }),
+                OP_DEV_INFO => (8, |b| DeviceMessage::DevInfo {
+                    build: u16::from_le_bytes([b[2], b[3]]),
+                    eeprom_version: b[4],
+                    file_type: b[5],
+                    auto_start: b[6],
+                    single_wire: b[7],
+                }),
+                OP_KEEPALIVE => (4, |_| DeviceMessage::Keepalive),
+                OP_NUM_BUSES => (3, |b| DeviceMessage::NumBuses(b[2])),
+                _ => {
+                    // Unknown opcode: drop the sync byte alone and resync from
+                    // the next one. Dropping the opcode too would swallow a
+                    // real header that happened to follow.
+                    self.buf.drain(..1);
+                    continue;
+                }
+            };
+
+            if self.buf.len() < len {
+                return out;
+            }
+            out.push(decode(&self.buf[..len]));
+            self.buf.drain(..len);
+        }
+    }
+
+    /// `F1 00 <ts:4LE> <id:4LE> <bus|dlc:1> <data:dlc_to_len>`; `None` until
+    /// complete. The trailing checksum byte is left for the resync scan.
+    fn take_frame(&mut self) -> Option<DeviceMessage> {
+        const HEADER: usize = 2 + 4 + 4 + 1;
+        // The caller has already established the two header bytes.
+        debug_assert!(self.buf.len() >= 2 && self.buf[0] == CMD && self.buf[1] == OP_FRAME);
+        if self.buf.len() < HEADER {
+            return None;
+        }
+
+        let bus_dlc = self.buf[10];
+        let dlc = bus_dlc & 0x0F;
+        // Decoded as FD unconditionally: GVRET has no FD flag, so a code above
+        // 8 can only mean an FD payload. Reading it as classic would cap the
+        // length at 8 and desynchronise the rest of the stream.
+        let len = dlc_to_len(dlc, true);
+        if self.buf.len() < HEADER + len {
+            return None;
+        }
+
+        let (arb_id, extended) = split_gvret_id(le_u32(&self.buf[6..10]));
+        let msg = DeviceMessage::Frame {
+            ts_us: le_u32(&self.buf[2..6]),
+            bus: (bus_dlc >> 4) & 0x0F,
+            arb_id,
+            extended,
+            dlc,
+            data: self.buf[HEADER..HEADER + len].to_vec(),
+        };
+        self.buf.drain(..HEADER + len);
+        Some(msg)
+    }
+}
+
+/// A four-byte little-endian read that cannot fail, for slices this module has
+/// already length-checked.
+#[inline]
+fn le_u32(b: &[u8]) -> u32 {
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+/// Append `F1 00` — a frame to transmit — to `out`.
+///
+/// Note this is **not** the inverse of [`encode_frame_into`]: a transmit has no
+/// timestamp, and it carries a byte *count* where a captured frame carries a
+/// data length code. That asymmetry is the protocol's, not this module's.
+///
+/// The payload is clamped to what a CAN FD frame can carry. No trailing
+/// checksum byte is written; see this module's header.
+#[inline]
+pub fn encode_transmit_into(out: &mut Vec<u8>, arb_id: u32, extended: bool, bus: u8, data: &[u8]) {
+    let take = data.len().min(64);
+    out.reserve(8 + take);
+    out.extend_from_slice(&[CMD, OP_FRAME]);
+    out.extend_from_slice(&make_gvret_id(arb_id, extended).to_le_bytes());
+    out.push(bus);
+    out.push(take as u8);
+    out.extend_from_slice(&data[..take]);
+}
+
+/// [`encode_transmit_into`] into a fresh buffer.
+pub fn encode_transmit(arb_id: u32, extended: bool, bus: u8, data: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(MAX_TRANSMIT_BYTES);
+    encode_transmit_into(&mut v, arb_id, extended, bus, data);
     v
 }
 
@@ -428,13 +684,17 @@ mod tests {
         assert_eq!(out.len(), 12 + 8);
     }
 
-    /// An FD payload whose length has no exact code rounds the code up, but
-    /// must not claim bytes the caller did not supply.
+    /// An FD payload whose length has no exact code rounds the code up, and the
+    /// frame must then carry as many bytes as the code names. Writing fewer
+    /// leaves a reader consuming the head of the next frame — this protocol has
+    /// no framing to recover with.
     #[test]
-    fn fd_frame_with_an_inexact_length_emits_only_what_it_was_given() {
+    fn fd_frame_with_an_inexact_length_is_padded_up_to_its_code() {
         let out = encode_frame(0, 0x100, false, 0, &[0xABu8; 9], true);
         assert_eq!(out[10] & 0x0F, 9, "9 bytes rounds up to code 9, meaning 12");
-        assert_eq!(out.len(), 12 + 9, "but only 9 payload bytes are written");
+        assert_eq!(out.len(), 12 + 12);
+        assert_eq!(&out[11..20], &[0xAB; 9]);
+        assert_eq!(&out[20..23], &[0, 0, 0], "padded, not truncated");
     }
 
     #[test]
@@ -616,7 +876,8 @@ mod tests {
         );
     }
 
-    /// Replicated quirk — see `docs/porting-notes.md` in WireTAP-Server.
+    /// Replicated quirk: the implementation this replaced behaved this way, and
+    /// a malformed request must desynchronise both of them identically.
     #[test]
     fn an_overlong_declared_length_consumes_all_of_it() {
         let mut d = binary_decoder();
@@ -638,7 +899,8 @@ mod tests {
         );
     }
 
-    /// Replicated quirk — see `docs/porting-notes.md` in WireTAP-Server.
+    /// Replicated quirk: the implementation this replaced behaved this way, and
+    /// a malformed request must desynchronise both of them identically.
     #[test]
     fn sync_bytes_are_consumed_even_in_binary_mode() {
         let mut d = binary_decoder();
@@ -648,5 +910,199 @@ mod tests {
             vec![],
             "the payload's E7 E7 is eaten by the handshake scan"
         );
+    }
+
+    // --- the host end ------------------------------------------------------
+
+    #[test]
+    fn transmit_bytes() {
+        // bus 1, 11-bit id 0x123, 3 bytes. No timestamp, no checksum.
+        assert_eq!(
+            encode_transmit(0x123, false, 1, &[0xAA, 0xBB, 0xCC]),
+            vec![0xF1, 0x00, 0x23, 0x01, 0x00, 0x00, 0x01, 0x03, 0xAA, 0xBB, 0xCC]
+        );
+    }
+
+    #[test]
+    fn an_extended_transmit_sets_the_top_id_bit() {
+        let out = encode_transmit(0x18DA_F110, true, 0, &[0x55]);
+        assert_eq!(&out[2..6], &[0x10, 0xF1, 0xDA, 0x98]);
+    }
+
+    /// A transmit carries a byte count, not a data length code — the one place
+    /// the two directions of this protocol disagree about that byte.
+    #[test]
+    fn a_transmit_carries_a_length_not_a_code() {
+        let out = encode_transmit(0x100, false, 0, &[0u8; 12]);
+        assert_eq!(out[7], 12, "12, not code 9");
+        assert_eq!(out.len(), 8 + 12);
+
+        let out = encode_transmit(0x100, false, 0, &[0u8; 64]);
+        assert_eq!(out.len(), MAX_TRANSMIT_BYTES);
+    }
+
+    #[test]
+    fn a_transmit_clamps_at_what_a_frame_can_carry() {
+        let out = encode_transmit(0x100, false, 0, &[0xFFu8; 80]);
+        assert_eq!(out[7], 64);
+        assert_eq!(out.len(), MAX_TRANSMIT_BYTES);
+    }
+
+    /// The pair a client and a server have to agree on, asserted as a pair:
+    /// what one end encodes is what the other decodes.
+    #[test]
+    fn a_captured_frame_round_trips_between_the_two_ends() {
+        for (arb, ext, bus, len, fd) in [
+            (0x123u32, false, 0u8, 8usize, false),
+            (0x18DA_F110, true, 1, 3, false),
+            (0x7FF, false, 2, 32, true),
+            (0x100, false, 0, 64, true),
+            (0x200, false, 0, 0, false),
+        ] {
+            let data: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let wire = encode_frame(0x1234, arb, ext, bus, &data, fd);
+            let got = DeviceDecoder::new().feed(&wire);
+            assert_eq!(
+                got,
+                vec![DeviceMessage::Frame {
+                    ts_us: 0x1234,
+                    bus,
+                    arb_id: arb,
+                    extended: ext,
+                    dlc: payload_dlc(len, fd),
+                    data,
+                }],
+                "id {arb:#x} len {len} fd {fd}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_control_reply_round_trips_between_the_two_ends() {
+        let mut wire = encode_timebase(0x0001_E240);
+        wire.extend(encode_canbus_params(2, &[500_000, 250_000]));
+        wire.extend(encode_dev_info());
+        wire.extend(encode_keepalive());
+        wire.extend(encode_num_buses(3));
+
+        assert_eq!(
+            DeviceDecoder::new().feed(&wire),
+            vec![
+                DeviceMessage::Timebase(0x0001_E240),
+                DeviceMessage::CanbusParams {
+                    enabled: [true, true],
+                    speeds: [500_000, 250_000],
+                },
+                DeviceMessage::DevInfo {
+                    build: 400,
+                    eeprom_version: 1,
+                    file_type: 0,
+                    auto_start: 0,
+                    single_wire: 0,
+                },
+                DeviceMessage::Keepalive,
+                DeviceMessage::NumBuses(3),
+            ]
+        );
+    }
+
+    /// The device info reply is eight bytes, not seven. Reading seven leaves a
+    /// byte behind that only survives because it is never `0xF1` — the WireTAP
+    /// desktop got away with it for exactly that reason.
+    #[test]
+    fn device_info_consumes_all_eight_of_its_bytes() {
+        let mut wire = encode_dev_info();
+        assert_eq!(wire.len(), 8);
+        wire.extend(encode_num_buses(1));
+        let mut d = DeviceDecoder::new();
+        assert_eq!(d.feed(&wire).len(), 2);
+        assert!(d.buf.is_empty(), "nothing left over");
+    }
+
+    /// The FD trap from the other direction: the low nibble is a code, and
+    /// reading it as a byte count would take 13 bytes for a 32-byte frame and
+    /// then parse the remaining payload as commands.
+    #[test]
+    fn an_fd_frame_decodes_by_its_code_not_its_nibble() {
+        let wire = encode_frame(0, 0x100, false, 0, &[0xAB; 32], true);
+        match &DeviceDecoder::new().feed(&wire)[0] {
+            DeviceMessage::Frame { dlc, data, .. } => {
+                assert_eq!(*dlc, 13);
+                assert_eq!(data.len(), 32);
+            }
+            other => panic!("expected a frame, got {other:?}"),
+        }
+    }
+
+    /// A device's trailing checksum byte, which this end does not consume —
+    /// the dialect note in this module's header, asserted rather than argued.
+    #[test]
+    fn a_frames_trailing_checksum_does_not_desynchronise_the_stream() {
+        let mut d = DeviceDecoder::new();
+        let got = d.feed(&[
+            0xF1, 0x00, 0x00, 0x00, 0x00, 0x00, // ts
+            0x23, 0x01, 0x00, 0x00, // id 0x123
+            0x01, 0xAA, // bus 0 dlc 1, payload
+            0x00, // checksum
+            0xF1, 0x09, 0xDE, 0xAD, // and the next message is still found
+        ]);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1], DeviceMessage::Keepalive);
+    }
+
+    /// A frame split across two reads must survive the boundary — the whole
+    /// point of an incremental decoder, and the case a per-read parser gets
+    /// wrong.
+    #[test]
+    fn a_frame_split_across_reads_is_reassembled() {
+        let wire = encode_frame(7, 0x321, false, 0, &[1, 2, 3, 4, 5, 6, 7, 8], false);
+        for split in 1..wire.len() {
+            let mut d = DeviceDecoder::new();
+            let mut got = d.feed(&wire[..split]);
+            got.extend(d.feed(&wire[split..]));
+            assert_eq!(got.len(), 1, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn resync_discards_leading_rubbish_from_a_device() {
+        let mut wire = vec![0x00, 0x11, 0x22];
+        wire.extend(encode_num_buses(2));
+        assert_eq!(
+            DeviceDecoder::new().feed(&wire),
+            vec![DeviceMessage::NumBuses(2)]
+        );
+    }
+
+    /// An unknown opcode drops only the sync byte: dropping the opcode too
+    /// would swallow a real header that happened to be the very next byte.
+    #[test]
+    fn an_unknown_device_opcode_resyncs_without_swallowing_the_next() {
+        let mut d = DeviceDecoder::new();
+        assert_eq!(
+            d.feed(&[0xF1, 0xF1, 0x0C, 0x02]),
+            vec![DeviceMessage::NumBuses(2)]
+        );
+    }
+
+    /// Unsynchronised noise must not grow without bound. A device that is
+    /// mid-frame is not noise, however slowly the rest arrives — the bound only
+    /// applies to a buffer with no sync byte in it at all.
+    #[test]
+    fn noise_is_bounded_but_a_partial_frame_is_not_dropped() {
+        let mut d = DeviceDecoder::new();
+        assert!(d.feed(&vec![0xEE; MAX_RESYNC_BYTES + 1]).is_empty());
+        assert!(d.buf.is_empty(), "noise past the bound is dropped");
+
+        // A header claiming 64 payload bytes, with 40 of them here.
+        let header = [0xF1, 0x00, 0, 0, 0, 0, 0x23, 0x01, 0, 0, 0x0F];
+        assert!(d.feed(&header).is_empty());
+        assert!(d.feed(&[0xAA; 40]).is_empty());
+        assert_eq!(d.buf.len(), header.len() + 40, "still waiting for the rest");
+
+        match &d.feed(&[0xAA; 24])[0] {
+            DeviceMessage::Frame { data, .. } => assert_eq!(data.len(), 64),
+            other => panic!("expected a frame, got {other:?}"),
+        }
     }
 }

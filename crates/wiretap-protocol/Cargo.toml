@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Scalar-in, scalar-out codecs for the wire protocols WireTAP speaks: the CAN data length code table, the GVRET serial protocol, and the ingest id-flag layout."
+description = "Scalar-in, scalar-out codecs for the wire protocols WireTAP speaks: the CAN data length code table, GVRET, SLCAN, gs_usb, the SocketCAN frame layouts and the ingest id-flag layout."
 readme = "README.md"
 
 # Empty, and it is meant to stay that way. README.md says why.

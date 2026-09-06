@@ -6,14 +6,26 @@ for byte. It depends on nothing at all: no serde, no async runtime, no driver.
 
 ## What's here
 
+Each module has a reference document beside it in [`docs/`](docs/), which says
+what the protocol is and what part of it this crate implements.
+
 - **`dlc`** — the CAN data length code table, `dlc_to_len`, `len_to_dlc` and
   `payload_dlc`. The wire carries a *code*, a database column stores a
   *length*, and above 8 bytes on CAN FD the two differ
-- **`gvret`** — the GVRET serial protocol: an incremental `Decoder` for the
-  command stream, and encoders for captured frames and every control reply.
-  This is the live bridge the WireTAP desktop and SavvyCAN connect to
-- **`ingest`** — the id-flag layout of the binary ingest protocol. Only the
-  layout; the framing and CRC live with both of their ends, in WireTAP-Server
+- **`gvret`** ([docs](docs/gvret.md)) — the GVRET serial protocol, both ends:
+  the host end a client speaks, and the device end a capture server speaks to
+  look like an adapter. SavvyCAN is the reference client
+- **`slcan`** ([docs](docs/slcan.md)) — the Lawicel ASCII protocol most USB-CAN
+  adapters speak, with the CAN FD extension the CANable 2.5 firmware added:
+  line framing, frames, commands and version replies
+- **`gs_usb`** ([docs](docs/gs_usb.md)) — the candleLight USB protocol: host
+  frames, the control-transfer layouts and the bit timing maths
+- **`socketcan`** ([docs](docs/socketcan.md)) — Linux's `can_frame` and
+  `canfd_frame`, and the flags packed alongside an id. A kernel ABI rather than
+  a wire format; see the module header
+- **`ingest`** ([docs](docs/ingest.md)) — the id-flag layout of the binary
+  ingest protocol. Only the layout: the framing and the CRC stay where both ends
+  of that wire already are
 
 ## Using it
 
@@ -22,17 +34,22 @@ wiretap-protocol = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git",
 ```
 
 `https`, not the `ssh` form the workspace README shows: this repository is
-public, and the things that build WireTAP-Server — a stock CI runner, a
-container, a musl cross-build — have no key between them. First released in
-v0.15.0, so nothing earlier can be pinned.
+public, and the things that build a consumer — a stock CI runner, a container, a
+musl cross-build — often have no key between them. First released in v0.15.0, so
+nothing earlier can be pinned.
 
 Encoders take a caller's buffer and scalars —
 `encode_frame_into(out, ts_us, arb_id, extended, bus, data, is_fd)` — because
-each consumer's frame type is its own and they are not reconcilable: the capture
-server's is CAN-only and stores no length code, the desktop's is multi-protocol
-and is a serde contract with its frontend. It follows that the crate depends on
-nothing: a client speaking one of these protocols should not have to take a
-capture stack to do it.
+each consumer's frame type is its own and they are not reconcilable: one is
+CAN-only and stores no length code, the next is multi-protocol and is a serde
+contract with a frontend. It follows that the crate depends on nothing: a client
+speaking one of these protocols should not have to take a capture stack to do
+it.
+
+Where a protocol packs several independent flags into one field — SLCAN's prefix
+character, a gs_usb host frame's id word — a module names a struct for its own
+wire shape instead, because an encoder taking six positional booleans is a
+defect waiting to happen. That struct is still the wire's, never a consumer's.
 
 **Before changing `gvret`:** the trailing byte after a frame's payload is a
 checksum every participant guesses differently, and the dialect they all

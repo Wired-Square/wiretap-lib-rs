@@ -12,7 +12,7 @@ A Cargo workspace of related **WireTAP** Rust libraries. Each crate lives under
 | [`wiretap-decode`](crates/wiretap-decode) | Protocol-agnostic decode core — bit extraction, 16-bit word-swap, exact `Decimal` scaling, and value formatting. `wiretap-catalog` builds on it; it has no dependency on the catalogue model. |
 | [`wiretap-checksum`](crates/wiretap-checksum) | Checksum algorithms (XOR, Sum8, CRC-8/16) and the engine that works out which one a link is using — a scored sweep of the named algorithms, plus solvers that recover an arbitrary CRC polynomial or an offset sum outright. |
 | [`wiretap-analysis`](crates/wiretap-analysis) | Payload analysis: per-byte-column statistics, and the identification pass that decides which bytes are worth solving as a checksum at all. Builds on `wiretap-checksum`. |
-| [`wiretap-protocol`](crates/wiretap-protocol) | The wire protocols WireTAP speaks, as scalars: the CAN data length code table, the GVRET serial protocol, and the ingest id-flag layout. No dependencies at all — not even serde. |
+| [`wiretap-protocol`](crates/wiretap-protocol) | The wire protocols WireTAP speaks, as scalars: the CAN data length code table, GVRET, SLCAN, gs_usb, the SocketCAN frame layouts and the ingest id-flag layout. No dependencies at all — not even serde. |
 
 `wiretap-catalog` is the top of the stack; `wiretap-decode` and
 `wiretap-checksum` are primitives with no dependency on the catalogue model, and
@@ -59,9 +59,9 @@ wiretap-protocol = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git",
 ```
 
 Both URL forms work; the choice belongs to the consumer. This repository is
-public, so `https` needs no key — WireTAP-Server pins over `https` because a
-stock CI runner, a container build and a musl cross-build all have to resolve it
-and none of them has a key.
+public, so `https` needs no key, which is what a consumer wants when a stock CI
+runner, a container build and a musl cross-build all have to resolve it and none
+of them has one.
 
 Two things consumers rely on that are not visible from their side: a tag names a
 tree whose tests passed, and a crate README's pin names a tag that exists.
