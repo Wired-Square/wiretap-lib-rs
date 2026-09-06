@@ -25,7 +25,7 @@ beside the addressing they are indexed by; reach for them there directly.
 ## Using it
 
 ```toml
-wiretap-analysis = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.15.4" }
+wiretap-analysis = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.16.0" }
 ```
 
 Nothing in this workspace depends on it; its consumers are outside.
