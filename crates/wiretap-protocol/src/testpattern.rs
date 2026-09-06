@@ -407,7 +407,7 @@ pub fn sweep_echo_matches(code: u8, fd: bool, echoed: &[u8]) -> bool {
 ///
 /// The rules are the protocol's, not an implementation's, which is why this is
 /// here: two ends comparing counters have to have counted the same way.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SequenceTracker {
     /// `None` until the first frame. A tracker that assumed zero would count
     /// everything before the first sequence number it saw as dropped, so a
@@ -425,12 +425,28 @@ pub struct SequenceTracker {
 /// wrapping, not sixty thousand frames arriving late.
 const WRAP_THRESHOLD: u16 = 32768;
 
+/// One bit per sequence number, 65536 of them.
+const SEEN_WORDS: usize = 1024;
+
+impl Default for SequenceTracker {
+    /// Written out rather than derived: a derived one would leave `seen` empty,
+    /// and `track` indexes it on the first frame.
+    fn default() -> Self {
+        Self {
+            expected: None,
+            seen: vec![0; SEEN_WORDS],
+            rx_count: 0,
+            drops: 0,
+            duplicates: 0,
+            out_of_order: 0,
+            gaps: Vec::new(),
+        }
+    }
+}
+
 impl SequenceTracker {
     pub fn new() -> Self {
-        Self {
-            seen: vec![0; 1024],
-            ..Self::default()
-        }
+        Self::default()
     }
 
     /// Record one received sequence number.
@@ -693,11 +709,11 @@ impl Responder {
                     .rx_count
                     .checked_mul(1_000_000)
                     .and_then(|f| f.checked_div(elapsed))
-                    .unwrap_or(0) as u32;
+                    .unwrap_or(0);
                 [
-                    (status_field::RX_COUNT, self.sequence.rx_count as u32),
-                    (status_field::TX_COUNT, self.tx_count as u32),
-                    (status_field::DROPS, self.sequence.drops as u32),
+                    (status_field::RX_COUNT, self.sequence.rx_count),
+                    (status_field::TX_COUNT, self.tx_count),
+                    (status_field::DROPS, self.sequence.drops),
                     (status_field::FPS, fps),
                 ]
                 .into_iter()
@@ -706,8 +722,10 @@ impl Responder {
                         Message::Status {
                             // A counter is 24 bits on this wire; a longer run
                             // saturates rather than wrapping to a small number
-                            // that reads as success.
-                            value: value.min(0x00FF_FFFF),
+                            // that reads as success. Clamped while still 64 bits
+                            // wide, because narrowing first wraps past 2³² and
+                            // leaves nothing for this to clamp.
+                            value: value.min(0x00FF_FFFF) as u32,
                             field,
                         },
                         flags,
@@ -1036,6 +1054,16 @@ mod tests {
         assert_eq!(t.duplicates, 1, "still remembered after 65,536 frames");
     }
 
+    /// `Default` is public, so it has to produce a tracker that works. A derived
+    /// one leaves the bitmap unallocated and the first frame panics.
+    #[test]
+    fn a_default_tracker_tracks() {
+        let mut t = SequenceTracker::default();
+        t.track(7);
+        t.track(7);
+        assert_eq!((t.rx_count, t.duplicates), (2, 1));
+    }
+
     // --- latency -----------------------------------------------------------
 
     #[test]
@@ -1251,20 +1279,28 @@ mod tests {
 
     /// A counter is 24 bits on this wire. A longer run must saturate rather
     /// than wrap to a small number that reads as a healthy link.
+    ///
+    /// `0x1_0000_0000` is the case the clamp alone does not cover: a counter
+    /// narrowed to 32 bits before being clamped arrives as 0, and a run that
+    /// received four billion frames reports receiving none.
     #[test]
     fn a_counter_past_the_wire_width_saturates() {
-        let mut r = started();
-        r.sequence.rx_count = 0x0100_0000;
-        let out = r.on_frame(
-            ID_CONTROL,
-            false,
-            false,
-            &encode(Message::Control(Command::RequestStatus), flags()),
-            1,
-        );
-        match decode(&out[0].data).unwrap().0 {
-            Message::Status { value, .. } => assert_eq!(value, 0x00FF_FFFF),
-            other => panic!("expected a status frame, got {other:?}"),
+        for count in [0x0100_0000, 0x1_0000_0000, u64::MAX] {
+            let mut r = started();
+            r.sequence.rx_count = count;
+            let out = r.on_frame(
+                ID_CONTROL,
+                false,
+                false,
+                &encode(Message::Control(Command::RequestStatus), flags()),
+                1,
+            );
+            match decode(&out[0].data).unwrap().0 {
+                Message::Status { value, .. } => {
+                    assert_eq!(value, 0x00FF_FFFF, "rx_count {count:#x}")
+                }
+                other => panic!("expected a status frame, got {other:?}"),
+            }
         }
     }
 
