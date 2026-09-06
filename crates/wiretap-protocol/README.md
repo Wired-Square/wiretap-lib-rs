@@ -34,7 +34,7 @@ what the protocol is and what part of it this crate implements.
 ## Using it
 
 ```toml
-wiretap-protocol = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.15.3" }
+wiretap-protocol = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.15.4" }
 ```
 
 First released in v0.15.0, so nothing earlier can be pinned. Either URL form
