@@ -33,10 +33,9 @@ what the protocol is and what part of it this crate implements.
 wiretap-protocol = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.15.2" }
 ```
 
-`https`, not the `ssh` form the workspace README shows: this repository is
-public, and the things that build a consumer — a stock CI runner, a container, a
-musl cross-build — often have no key between them. First released in v0.15.0, so
-nothing earlier can be pinned.
+First released in v0.15.0, so nothing earlier can be pinned. Either URL form
+works, and the workspace README says why `https` is usually the one a consumer
+wants.
 
 Encoders take a caller's buffer and scalars —
 `encode_frame_into(out, ts_us, arb_id, extended, bus, data, is_fd)` — because
