@@ -19,6 +19,8 @@
 //! - [`gs_usb`] — the candleLight USB protocol.
 //! - [`socketcan`] — Linux's CAN frame layouts. A kernel ABI, not a wire
 //!   format; see the module header.
+//! - [`testpattern`] — two endpoints proving a CAN link carries what it claims
+//!   to, including a sweep across every data length code.
 //! - [`ingest`] — the id-flag layout of the binary ingest protocol.
 
 pub mod dlc;
@@ -27,6 +29,7 @@ pub mod gvret;
 pub mod ingest;
 pub mod slcan;
 pub mod socketcan;
+pub mod testpattern;
 
 /// Arbitration id masks. Named for the id width rather than for a protocol,
 /// because that is what they are: every protocol here masks the same 29 and 11

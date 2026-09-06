@@ -23,6 +23,10 @@ what the protocol is and what part of it this crate implements.
 - **`socketcan`** ([docs](docs/socketcan.md)) — Linux's `can_frame` and
   `canfd_frame`, and the flags packed alongside an id. A kernel ABI rather than
   a wire format; see the module header
+- **`testpattern`** ([docs](docs/test-pattern.md)) — two endpoints proving a CAN
+  link carries what it claims to: a length sweep across every data length code,
+  plus ping, latency and the control handshake that binds a run. Both sides,
+  with the reply half as a sans-io state machine
 - **`ingest`** ([docs](docs/ingest.md)) — the id-flag layout of the binary
   ingest protocol. Only the layout: the framing and the CRC stay where both ends
   of that wire already are
