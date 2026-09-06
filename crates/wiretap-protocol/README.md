@@ -30,7 +30,7 @@ what the protocol is and what part of it this crate implements.
 ## Using it
 
 ```toml
-wiretap-protocol = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.15.1" }
+wiretap-protocol = { git = "https://github.com/Wired-Square/wiretap-lib-rs.git", tag = "v0.15.2" }
 ```
 
 `https`, not the `ssh` form the workspace README shows: this repository is
