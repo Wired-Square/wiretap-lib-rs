@@ -279,9 +279,18 @@ sweeps while that run is live, reports its counters on request, and goes quiet o
 `Stop`. It returns a `Vec` rather than a single reply because a status request is
 answered by four frames; an empty one does not allocate.
 
-**Not implemented here: the byte-stream mapping.** The contract also describes
-carrying these payloads over a serial link with COBS or SLIP framing, tag byte
-alone identifying the type and flags bit 0 set. Nothing in this crate encodes or
-decodes it, and no consumer has yet needed it. It is documented because the
-message layout above is transport-independent and a byte-stream implementation
-should not have to reinvent it.
+### Documented, and deliberately not acted on here
+
+Three parts of the contract above are encoded and decoded but go no further, so
+that a peer implementing them is understood rather than rejected:
+
+- **The byte-stream mapping** (§1 data-mode flag) — carrying these payloads over
+  a serial link with COBS or SLIP framing, tag byte alone identifying the type.
+  Nothing here encodes or decodes the framing. It is specified because the
+  message layout is transport-independent and a byte-stream implementation
+  should not have to reinvent it.
+- **The throughput return stream** (`0x7F3`) — a responder streaming its own
+  counters back at the initiator. The id is part of the map; `Responder` counts
+  throughput frames and does not answer them.
+- **`Set rate`** — `Responder` decodes it and ignores it, because a responder
+  that only echoes has no rate of its own to set. It is for one that streams.

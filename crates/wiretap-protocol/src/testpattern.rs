@@ -509,10 +509,6 @@ impl Latencies {
         self.samples.push(rtt_us);
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.samples.is_empty()
-    }
-
     /// `None` until something has been recorded.
     pub fn stats(&self) -> Option<LatencyStats> {
         if self.samples.is_empty() {
@@ -636,29 +632,29 @@ impl Responder {
             return Vec::new();
         }
 
+        // Everything the initiator numbered is counted, answered or not.
+        if let Message::PingRequest { seq }
+        | Message::LatencyProbe { seq, .. }
+        | Message::Throughput { seq, .. } = msg
+        {
+            self.sequence.track(seq);
+        }
+
+        // Throughput is one-way by definition, so it is the one that is counted
+        // and not answered.
         let reply = match msg {
-            Message::PingRequest { seq } => {
-                self.sequence.track(seq);
-                Some(Message::PingReply { seq })
-            }
-            Message::LatencyProbe { seq, ts_us } => {
-                self.sequence.track(seq);
-                // The probe's own timestamp goes back untouched: the initiator
-                // measures against its own clock, and reading this one would
-                // make the result depend on two clocks agreeing.
-                Some(Message::LatencyReply { seq, ts_us })
-            }
-            Message::Throughput { seq, .. } => {
-                // One-way by definition — counted, not answered.
-                self.sequence.track(seq);
-                None
-            }
+            Message::PingRequest { seq } => Some(Message::PingReply { seq }),
+            // The probe's own timestamp goes back untouched: the initiator
+            // measures against its own clock, and reading this one would make
+            // the result depend on two clocks agreeing.
+            Message::LatencyProbe { seq, ts_us } => Some(Message::LatencyReply { seq, ts_us }),
             _ => None,
         };
 
         reply
-            .map(|m| vec![self.frame(m, flags, extended, fd)])
-            .unwrap_or_default()
+            .into_iter()
+            .map(|m| self.frame(m, flags, extended, fd))
+            .collect()
     }
 
     fn on_control(
